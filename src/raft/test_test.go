@@ -49,7 +49,6 @@ func TestInitialElection2A(t *testing.T) {
 	fmt.Printf("term1: %d term2: %d\n", term1, term2)
 
 	// there should still be a leader.
-	fmt.Printf("check one leader...")
 	cfg.checkOneLeader()
 
 	cfg.end()

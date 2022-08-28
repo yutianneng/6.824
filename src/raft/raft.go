@@ -324,8 +324,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	//接收对方的请求就是认定它为leader
 	rf.leaderId = args.LeaderId
+	DPrintf("node[%d] role[%v] received from node[%d], reset lastActiveTime[%v]", rf.me, rf.role, args.LeaderId, rf.lastActiveTime.UnixMilli())
 	rf.lastActiveTime = time.Now()
-	rf.timeoutInterval = randElectionTimeout()
 	rf.persist()
 }
 
@@ -393,12 +393,12 @@ func (rf *Raft) heartBeatLoop() {
 			if rf.role != Leader {
 				return
 			}
-			if time.Now().Sub(rf.lastHeartBeatTime) < rf.timeoutInterval {
+			if time.Now().Sub(rf.lastHeartBeatTime) < 100 {
 				return
 			}
 			rf.sendHeartBeat()
 			rf.lastHeartBeatTime = time.Now()
-			rf.timeoutInterval = heartBeatTimeout()
+			//rf.timeoutInterval = heartBeatTimeout()
 			rf.mu.Lock()
 			if rf.role != Leader {
 				rf.lastActiveTime = time.Now()
@@ -413,11 +413,15 @@ func (rf *Raft) electionLoop() {
 		//leader结点只是空循环，不做实际操作
 		time.Sleep(time.Millisecond * 1)
 		func() {
+			if rf.role == Leader {
+				return
+			}
 			elapses := time.Now().Sub(rf.lastActiveTime)
+			timeoutInterval := randElectionTimeout()
 			rf.mu.Lock()
 			if rf.role == Follower {
 				//超时进入candidate
-				if elapses >= rf.timeoutInterval {
+				if elapses >= timeoutInterval {
 					DPrintf("node[%d] term: %d Follower -> Candidate", rf.me, rf.term)
 					rf.role = Candidate
 				} else {
@@ -426,27 +430,32 @@ func (rf *Raft) electionLoop() {
 					return
 				}
 			}
-			if rf.role != Candidate || elapses < rf.timeoutInterval {
+			if rf.role != Candidate || elapses < timeoutInterval {
 				rf.mu.Unlock()
 				return
 			}
+			DPrintf("become candidate... node[%v] term[%v] role[%v] elapses>=timeoutInterval[%v]", rf.me, rf.term, rf.role, elapses >= timeoutInterval)
 
-			//会释放锁
 			maxTerm, voteGranted := rf.becomeCandidate()
-			DPrintf("node[%d] term[%d] role[%v] voteGranted: %d maxTerm: %d", rf.me, rf.term, rf.role, voteGranted, maxTerm)
+			//会释放锁
+			//rf.timeoutInterval = randElectionTimeout()
+			rf.lastActiveTime = time.Now()
 			rf.mu.Lock()
+			DPrintf("node[%d] role[%v] maxTerm[%d] voteGranted[%d] nPeers[%d]", rf.me, rf.role, maxTerm, voteGranted, rf.nPeers)
+			if rf.role != Candidate {
+				rf.mu.Unlock()
+				return
+			}
 			if maxTerm > rf.term {
 				rf.role = Follower
 				rf.votedFor = RoleNone
 				rf.leaderId = RoleNone
 				rf.term = maxTerm
-			} else if rf.role == Candidate && voteGranted > rf.nPeers/2 {
+			} else if voteGranted > rf.nPeers/2 {
 				rf.role = Leader
 				rf.leaderId = rf.me
 				rf.lastHeartBeatTime = time.Unix(0, 0)
 			}
-			rf.lastActiveTime = time.Now()
-			rf.timeoutInterval = randElectionTimeout()
 			rf.persist()
 			rf.mu.Unlock()
 		}()
@@ -473,7 +482,6 @@ func (rf *Raft) sendHeartBeat() {
 		if rf.me == i {
 			continue
 		}
-		DPrintf("node[%d] term[%v] role[%v] send heartbeat to node[%d]", rf.me, rf.term, rf.role.String(), i)
 		go func(server int, args *AppendEntriesArgs) {
 			reply := &AppendEntriesReply{}
 			ok := rf.sendAppendEntries(server, args, reply)
@@ -485,7 +493,9 @@ func (rf *Raft) sendHeartBeat() {
 					rf.votedFor = RoleNone
 					rf.leaderId = RoleNone
 					rf.term = reply.Term
+					DPrintf("node[%d] term[%v] role[%v] send heartbeat to node[%d], reply.Term>rf.term", rf.me, rf.term, rf.role.String(), i)
 					rf.mu.Unlock()
+
 				}
 			}
 		}(i, args)
@@ -575,21 +585,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
 	rf := &Raft{
-		mu:              sync.Mutex{},
-		peers:           peers,
-		persister:       persister,
-		me:              me,
-		nPeers:          len(peers),
-		leaderId:        RoleNone,
-		term:            None,
-		votedFor:        RoleNone,
-		role:            Follower,
-		lastActiveTime:  time.Now(),
-		timeoutInterval: randElectionTimeout(),
-		commitIndex:     0,
-		lastApplied:     0,
-		applyCond:       nil,
-		applyChan:       applyCh,
+		mu:             sync.Mutex{},
+		peers:          peers,
+		persister:      persister,
+		me:             me,
+		nPeers:         len(peers),
+		leaderId:       RoleNone,
+		term:           None,
+		votedFor:       RoleNone,
+		role:           Follower,
+		lastActiveTime: time.Now(),
+		commitIndex:    0,
+		lastApplied:    0,
+		applyCond:      nil,
+		applyChan:      applyCh,
 	}
 	DPrintf("starting new raft node, id: %d", me)
 	//超时设置
