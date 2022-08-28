@@ -8,7 +8,10 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"log"
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
@@ -20,12 +23,12 @@ import "sync"
 const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestInitialElection2A(t *testing.T) {
+	log.SetFlags(log.Ltime | log.Lshortfile)
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2A): initial election")
-
 	// is a leader elected?
 	cfg.checkOneLeader()
 
@@ -43,14 +46,18 @@ func TestInitialElection2A(t *testing.T) {
 	if term1 != term2 {
 		fmt.Printf("warning: term changed even though there were no failures")
 	}
+	fmt.Printf("term1: %d term2: %d\n", term1, term2)
 
 	// there should still be a leader.
+	fmt.Printf("check one leader...")
 	cfg.checkOneLeader()
 
 	cfg.end()
 }
 
 func TestReElection2A(t *testing.T) {
+	fmt.Printf("TestReElection2A\n")
+
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -94,6 +101,7 @@ func TestManyElections2A(t *testing.T) {
 	servers := 7
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
+	fmt.Printf("Test (2A): multiple elections\n")
 
 	cfg.begin("Test (2A): multiple elections")
 
