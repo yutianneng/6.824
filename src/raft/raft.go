@@ -261,6 +261,11 @@ type AppendEntriesReply struct {
 //
 // 处理投票请求，决定是否投票
 //
+//1. leader只有收到更高任期的请求时才会退化为follower，如果被隔离，那么它会一直认为自己是leader
+//2. follower在收到大于自己term的请求时需要更新自己的term，避免旧leader的干扰
+//3. 收到有效的请求时才将自己的超时计时器重置
+//4. 每个term只会有一个leader
+//5. 某个突然网络连通的结点进行选举，而且term和当前leader一样，此时需要判断voteFor，不要重复投票
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
@@ -283,6 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.leaderId = -1
 	}
+	//避免重复投票
 	if rf.votedFor == RoleNone || rf.votedFor == args.CandidateId {
 		lastLogTerm, lastLogIndex := rf.lastLogTermAndLastLogIndex()
 		if lastLogIndex <= args.LastLogIndex && lastLogTerm <= args.LastLogTerm {
@@ -298,6 +304,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 //只有follower、candidate能够接收到这个请求
+//如果收到term比自己大的AppendEntries请求，则表示发生过新一轮的选举，此时拒绝掉，等待超时选举
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 	rf.mu.Lock()
@@ -321,6 +328,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.role = Follower
 		rf.votedFor = RoleNone
 		rf.leaderId = RoleNone
+		return
 	}
 	//接收对方的请求就是认定它为leader
 	rf.leaderId = args.LeaderId
@@ -396,13 +404,18 @@ func (rf *Raft) heartBeatLoop() {
 			if time.Now().Sub(rf.lastHeartBeatTime) < 100 {
 				return
 			}
-			rf.sendHeartBeat()
-			rf.lastHeartBeatTime = time.Now()
-			//rf.timeoutInterval = heartBeatTimeout()
+			maxTerm := rf.sendHeartBeat()
 			rf.mu.Lock()
-			if rf.role != Leader {
+			if maxTerm > rf.term {
+				//先更新时间，避免leader一进入follower就超时
+				rf.term = maxTerm
 				rf.lastActiveTime = time.Now()
-				rf.timeoutInterval = randElectionTimeout()
+				rf.role = Follower
+				rf.votedFor = RoleNone
+				rf.leaderId = RoleNone
+			} else {
+				rf.lastHeartBeatTime = time.Now()
+				//rf.timeoutInterval = heartBeatTimeout()
 			}
 			rf.mu.Unlock()
 		}()
@@ -418,51 +431,43 @@ func (rf *Raft) electionLoop() {
 			}
 			elapses := time.Now().Sub(rf.lastActiveTime)
 			timeoutInterval := randElectionTimeout()
+			if elapses < timeoutInterval {
+				//不超时不需要进入下一步，只需要接收RequestVote和AppendEntries请求即可
+				return
+			}
 			rf.mu.Lock()
 			if rf.role == Follower {
-				//超时进入candidate
-				if elapses >= timeoutInterval {
-					DPrintf("node[%d] term: %d Follower -> Candidate", rf.me, rf.term)
-					rf.role = Candidate
-				} else {
-					rf.mu.Unlock()
-					//不超时不需要进入下一步，只需要接收RequestVote和AppendEntries请求即可
-					return
-				}
-			}
-			if rf.role != Candidate || elapses < timeoutInterval {
-				rf.mu.Unlock()
-				return
+				DPrintf("node[%d] term: %d Follower -> Candidate", rf.me, rf.term)
+				rf.role = Candidate
 			}
 			DPrintf("become candidate... node[%v] term[%v] role[%v] elapses>=timeoutInterval[%v]", rf.me, rf.term, rf.role, elapses >= timeoutInterval)
 
 			maxTerm, voteGranted := rf.becomeCandidate()
-			//会释放锁
+
+			rf.mu.Lock()
 			//rf.timeoutInterval = randElectionTimeout()
 			rf.lastActiveTime = time.Now()
-			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			DPrintf("node[%d] role[%v] maxTerm[%d] voteGranted[%d] nPeers[%d]", rf.me, rf.role, maxTerm, voteGranted, rf.nPeers)
 			if rf.role != Candidate {
-				rf.mu.Unlock()
 				return
 			}
 			if maxTerm > rf.term {
 				rf.role = Follower
+				rf.term = maxTerm
 				rf.votedFor = RoleNone
 				rf.leaderId = RoleNone
-				rf.term = maxTerm
 			} else if voteGranted > rf.nPeers/2 {
+				rf.lastHeartBeatTime = time.Unix(0, 0)
 				rf.role = Leader
 				rf.leaderId = rf.me
-				rf.lastHeartBeatTime = time.Unix(0, 0)
 			}
 			rf.persist()
-			rf.mu.Unlock()
 		}()
 	}
 }
 
-func (rf *Raft) sendHeartBeat() {
+func (rf *Raft) sendHeartBeat() int64 {
 
 	logEntries := make([]*LogEntry, 0)
 	logEntries = append(logEntries, &LogEntry{
@@ -477,7 +482,7 @@ func (rf *Raft) sendHeartBeat() {
 		peerId int
 		resp   *AppendEntriesReply
 	}
-
+	resultChan := make(chan *AppendEntriesResult, rf.nPeers-1)
 	for i := 0; i < rf.nPeers; i++ {
 		if rf.me == i {
 			continue
@@ -487,20 +492,29 @@ func (rf *Raft) sendHeartBeat() {
 			ok := rf.sendAppendEntries(server, args, reply)
 			if ok {
 				//发现更大的term则退回Follower
-				if reply.Term > rf.term {
-					rf.mu.Lock()
-					rf.role = Follower
-					rf.votedFor = RoleNone
-					rf.leaderId = RoleNone
-					rf.term = reply.Term
-					DPrintf("node[%d] term[%v] role[%v] send heartbeat to node[%d], reply.Term>rf.term", rf.me, rf.term, rf.role.String(), i)
-					rf.mu.Unlock()
-
+				resultChan <- &AppendEntriesResult{
+					peerId: server,
+					resp:   reply,
+				}
+			} else {
+				resultChan <- &AppendEntriesResult{
+					peerId: server,
+					resp:   nil,
 				}
 			}
+			DPrintf("node[%d] term[%v] role[%v] send heartbeat to node[%d], reply.Term>rf.term", rf.me, rf.term, rf.role.String(), server)
 		}(i, args)
 	}
-
+	var maxTerm int64 = rf.term
+	for {
+		select {
+		case result := <-resultChan:
+			if result.resp != nil && result.resp.Term > maxTerm {
+				maxTerm = result.resp.Term
+			}
+		}
+	}
+	return maxTerm
 }
 
 //
@@ -533,12 +547,12 @@ func (rf *Raft) becomeCandidate() (int64, int) {
 			ok := rf.sendRequestVote(server, args, reply)
 			if ok {
 				voteChan <- &RequestVoteResult{
-					peerId: i,
+					peerId: server,
 					resp:   reply,
 				}
 			} else {
 				voteChan <- &RequestVoteResult{
-					peerId: i,
+					peerId: server,
 					resp:   nil,
 				}
 			}
@@ -551,6 +565,7 @@ func (rf *Raft) becomeCandidate() (int64, int) {
 	for i := 0; i < rf.nPeers-1; i++ {
 		select {
 		case vote := <-voteChan:
+			totalVote++
 			if vote.resp != nil {
 				if vote.resp.VoteGranted {
 					voteGranted++
@@ -560,7 +575,9 @@ func (rf *Raft) becomeCandidate() (int64, int) {
 					maxTerm = vote.resp.Term
 				}
 			}
-			totalVote++
+			if voteGranted > rf.nPeers/2 {
+				return maxTerm, voteGranted
+			}
 		}
 	}
 	return maxTerm, voteGranted
