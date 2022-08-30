@@ -81,11 +81,15 @@ type Raft struct {
 	commitIndex int64
 	lastApplied int64
 
+	appendEntriesChan chan AppendEntriesStruct
 	//状态机
 	applyCond *sync.Cond
 	applyChan chan ApplyMsg
 }
 
+type AppendEntriesStruct struct {
+	Type LogType
+}
 type MemberRole int
 
 const (
@@ -248,6 +252,7 @@ type RequestVoteReply struct {
 // 心跳或者日志追加
 //
 type AppendEntriesArgs struct {
+	Type     LogType
 	LeaderId int
 	Term     int64 //leader currentTerm
 	//用于日志复制，确保前面日志能够匹配
@@ -458,20 +463,14 @@ func (rf *Raft) heartBeatLoop() {
 			if time.Now().Sub(rf.lastHeartBeatTime) < 100 && rf.commitIndex >= rf.lastLogIndex() {
 				return
 			}
-			maxTerm := rf.sendHeartBeat()
-			rf.mu.Lock()
-			if maxTerm > rf.term {
-				//先更新时间，避免leader一进入follower就超时
-				rf.term = maxTerm
-				rf.lastActiveTime = time.Now()
-				rf.role = Follower
-				rf.votedFor = RoleNone
-				rf.leaderId = RoleNone
-			} else {
-				rf.lastHeartBeatTime = time.Now()
-				//rf.timeoutInterval = heartBeatTimeout()
+			rf.lastHeartBeatTime = time.Now()
+			appendEntriesStruct := AppendEntriesStruct{Type: HeartBeatLogType}
+			if rf.commitIndex < rf.lastLogIndex() {
+				appendEntriesStruct.Type = AppendEntryLogType
 			}
-			rf.mu.Unlock()
+			DPrintf("trigger appendEntriesLoop: %v", mr.Any2String(appendEntriesStruct))
+			rf.appendEntriesChan <- appendEntriesStruct
+			//maxTerm := rf.sendHeartBeat()
 		}()
 	}
 }
@@ -481,11 +480,11 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 
 	if !rf.killed() {
 		for {
-
 			applyMsgs := make([]ApplyMsg, 0)
 			func() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				rf.applyCond.Wait()
 				for rf.lastApplied < rf.commitIndex {
 					rf.lastApplied++
 					applyMsgs = append(applyMsgs, ApplyMsg{
@@ -549,100 +548,125 @@ func (rf *Raft) electionLoop() {
 	}
 }
 
-func (rf *Raft) sendHeartBeat() int64 {
+func (rf *Raft) appendEntriesLoop() {
 
 	type AppendEntriesResult struct {
 		peerId int
 		resp   *AppendEntriesReply
 	}
-	resultChan := make(chan *AppendEntriesResult, rf.nPeers-1)
-	for i := 0; i < rf.nPeers; i++ {
-		if rf.me == i {
-			continue
-		}
-		args := &AppendEntriesArgs{
-			Term:                rf.term,
-			LeaderId:            rf.me,
-			LeaderCommitedIndex: rf.commitIndex,
-			LogEntries:          make([]*LogEntry, 0),
-			PrevLogIndex:        rf.log.NextIndexs[i] - 1,
-		}
-		if args.PrevLogIndex > 0 {
-			args.PrevLogTerm = rf.log.Entries[args.PrevLogIndex-1].LogTerm
-			args.LogEntries = append(args.LogEntries, rf.log.Entries[args.PrevLogIndex-1:]...)
-		}
+	for !rf.killed() {
+		c := <-rf.appendEntriesChan
+		resultChan := make(chan *AppendEntriesResult, rf.nPeers-1)
+		for i := 0; i < rf.nPeers; i++ {
+			if rf.me == i {
+				continue
+			}
+			argsI := &AppendEntriesArgs{
+				Term:                rf.term,
+				LeaderId:            rf.me,
+				LeaderCommitedIndex: rf.commitIndex,
+				//复制follower缺少的日志
+			}
+			lastLogTerm, lastLogIndex := rf.lastLogTermAndLastLogIndex()
+			argsI.PrevLogIndex = lastLogIndex
+			argsI.PrevLogTerm = lastLogTerm
+			if c.Type == AppendEntryLogType && argsI.PrevLogIndex > 0 {
+				argsI.LogEntries = make([]*LogEntry, 0)
+				argsI.LogEntries = append(argsI.LogEntries, rf.log.Entries[argsI.PrevLogIndex-1:]...)
+			}
 
-		go func(server int, args *AppendEntriesArgs) {
-			reply := &AppendEntriesReply{}
-			ok := rf.sendAppendEntries(server, args, reply)
-			if !ok {
+			go func(server int, args *AppendEntriesArgs) {
+				reply := &AppendEntriesReply{}
+				defer func() {
+					DPrintf("args: %v reply: %v", mr.Any2String(args), mr.Any2String(reply))
+				}()
+				ok := rf.sendAppendEntries(server, args, reply)
+				if !ok {
+					resultChan <- &AppendEntriesResult{
+						peerId: server,
+						resp:   nil,
+					}
+					return
+				}
 				resultChan <- &AppendEntriesResult{
 					peerId: server,
-					resp:   nil,
+					resp:   reply,
 				}
-				return
-			}
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			//发现更大的term则退回Follower
-			if rf.term > args.Term {
-				return
-			}
-			if reply.Term > rf.term {
-				rf.term = reply.Term
-				rf.lastActiveTime = time.Now()
-				rf.votedFor = RoleNone
-				rf.leaderId = RoleNone
-				rf.role = Follower
-				rf.persist()
-				return
-			}
-			if reply.IsAccept {
-				rf.log.NextIndexs[server] += int64(len(args.LogEntries))
-				rf.log.MatchIndexs[server] = rf.log.NextIndexs[server] - 1
-				//更新commitIndex，对所有结点的matchIndex排序，选择中点
-				sortMatchIndexs := make([]int64, 0, rf.nPeers)
-				_, lastIndex := rf.lastLogTermAndLastLogIndex()
-				sortMatchIndexs = append(sortMatchIndexs, lastIndex)
-				for k := 0; k < rf.nPeers; k++ {
-					if k == rf.me {
-						continue
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				//如果term变了，表示该结点不再是leader，什么也不做
+				if rf.term != args.Term {
+					return
+				}
+				if reply.Term > rf.term {
+					rf.term = reply.Term
+					rf.lastActiveTime = time.Now()
+					rf.votedFor = RoleNone
+					rf.leaderId = RoleNone
+					rf.role = Follower
+					rf.persist()
+					return
+				}
+				if reply.IsAccept {
+					rf.log.NextIndexs[server] += int64(len(args.LogEntries))
+					rf.log.MatchIndexs[server] = rf.log.NextIndexs[server] - 1
+					//更新commitIndex，对所有结点的matchIndex排序，选择中点
+					sortMatchIndexs := make([]int64, 0, rf.nPeers)
+					_, lastIndex := rf.lastLogTermAndLastLogIndex()
+					sortMatchIndexs = append(sortMatchIndexs, lastIndex)
+					for k := 0; k < rf.nPeers; k++ {
+						if k == rf.me {
+							continue
+						}
+						sortMatchIndexs = append(sortMatchIndexs, rf.log.MatchIndexs[k])
 					}
-					sortMatchIndexs = append(sortMatchIndexs, rf.log.MatchIndexs[k])
+					sort.Slice(sortMatchIndexs, func(i, j int) bool {
+						return sortMatchIndexs[i] < sortMatchIndexs[j]
+					})
+					newCommitIndex := sortMatchIndexs[rf.nPeers/2]
+					//因为有可能是follower恢复数据，并不是本term提交的数据
+					if newCommitIndex > rf.commitIndex && rf.log.Entries[newCommitIndex-1].LogTerm == rf.term {
+						rf.commitIndex = newCommitIndex
+					}
+				} else {
+					rf.log.NextIndexs[server] -= 1
+					if rf.log.NextIndexs[server] < 1 {
+						rf.log.NextIndexs[server] = 1
+					}
 				}
-				sort.Slice(sortMatchIndexs, func(i, j int) bool {
-					return sortMatchIndexs[i] < sortMatchIndexs[j]
-				})
-				newCommitIndex := sortMatchIndexs[rf.nPeers/2]
-				//因为有可能是follower恢复数据，并不是本term提交的数据
-				if newCommitIndex > rf.commitIndex && rf.log.Entries[newCommitIndex-1].LogTerm == rf.term {
-					rf.commitIndex = newCommitIndex
+				DPrintf("node[%d] term[%v] role[%v] send heartbeat to node[%d], reply.Term>rf.term", rf.me, rf.term, rf.role.String(), server)
+			}(i, argsI)
+		}
+		var maxTerm = rf.term
+		accepted := 1
+		for {
+			select {
+			case result := <-resultChan:
+				if result.resp != nil && result.resp.Term > maxTerm {
+					maxTerm = result.resp.Term
 				}
-			} else {
-				rf.log.NextIndexs[server] -= 1
-				if rf.log.NextIndexs[server] < 1 {
-					rf.log.NextIndexs[server] = 1
+				if result.resp != nil && result.resp.IsAccept {
+					accepted++
 				}
 			}
-
-			resultChan <- &AppendEntriesResult{
-				peerId: server,
-				resp:   reply,
-			}
-
-			DPrintf("node[%d] term[%v] role[%v] send heartbeat to node[%d], reply.Term>rf.term", rf.me, rf.term, rf.role.String(), server)
-		}(i, args)
-	}
-	var maxTerm int64 = rf.term
-	for {
-		select {
-		case result := <-resultChan:
-			if result.resp != nil && result.resp.Term > maxTerm {
-				maxTerm = result.resp.Term
+			if accepted > rf.nPeers/2 || maxTerm > rf.term {
+				break
 			}
 		}
+		rf.mu.Lock()
+		if maxTerm > rf.term {
+			//先更新时间，避免leader一进入follower就超时
+			rf.term = maxTerm
+			rf.lastActiveTime = time.Now()
+			rf.role = Follower
+			rf.votedFor = RoleNone
+			rf.leaderId = RoleNone
+		} else {
+			rf.lastHeartBeatTime = time.Now()
+			//rf.timeoutInterval = heartBeatTimeout()
+		}
+		rf.mu.Unlock()
 	}
-	return maxTerm
 }
 
 //
@@ -740,8 +764,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		votedFor:       RoleNone,
 		role:           Follower,
 		lastActiveTime: time.Now(),
-		commitIndex:    0,
-		lastApplied:    0,
+		commitIndex:    None,
+		lastApplied:    None,
 		applyChan:      applyCh,
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
@@ -760,6 +784,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.electionLoop()
 	go rf.heartBeatLoop()
 	go rf.applyLogLoop(applyCh)
+	go rf.appendEntriesLoop()
 
 	return rf
 }
