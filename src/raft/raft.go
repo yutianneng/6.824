@@ -78,7 +78,7 @@ type Raft struct {
 
 	//提交情况
 	//log         *RaftLog
-	log         []*LogEntry
+	logs        []*LogEntry
 	nextIndex   []int
 	matchIndex  []int
 	commitIndex int
@@ -216,22 +216,22 @@ func (rf *Raft) persist() {
 }
 
 func (rf *Raft) lastLogTermAndLastLogIndex() (int, int) {
-	if len(rf.log) == 0 {
+	if len(rf.logs) == 0 {
 		return 0, 0
 	}
-	logTerm := rf.log[len(rf.log)-1].LogTerm
-	logIndex := rf.log[len(rf.log)-1].LogIndex
+	logTerm := rf.logs[len(rf.logs)-1].LogTerm
+	logIndex := rf.logs[len(rf.logs)-1].LogIndex
 	return logTerm, logIndex
 }
 
 func (rf *Raft) lastLogIndex() int {
-	if len(rf.log) == 0 {
+	if len(rf.logs) == 0 {
 		return 0
 	}
-	return rf.log[len(rf.log)-1].LogIndex
+	return rf.logs[len(rf.logs)-1].LogIndex
 }
 func (rf *Raft) logTerm(logIndex int) int {
-	return rf.log[logIndex].LogTerm
+	return rf.logs[logIndex].LogTerm
 }
 
 //
@@ -376,25 +376,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i := 0; i < len(args.LogEntries); i++ {
 		index++
 		if index > lastLogIndex {
-			rf.log = append(rf.log, args.LogEntries[i])
+			rf.logs = append(rf.logs, args.LogEntries[i])
 		} else {
 			//此节点和leader结点日志不一致，截断
-			if rf.log[index].LogTerm != args.LogEntries[i].LogTerm {
-				rf.log = rf.log[:index]
-				rf.log = append(rf.log, args.LogEntries[i])
+			if rf.logs[index].LogTerm != args.LogEntries[i].LogTerm {
+				rf.logs = rf.logs[:index]
+				rf.logs = append(rf.logs, args.LogEntries[i])
 			}
 		}
 	}
 	//follower更新commitIndex
-	if args.LeaderCommitedIndex > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommitedIndex
-		if lastLogIndex < rf.commitIndex {
-			rf.commitIndex = index
-		}
-	}
+	rf.commitIndex = index
 	rf.nextIndex[rf.me] = index + 1
 	rf.matchIndex[rf.me] = index
-	DPrintf("log: %v, index: %v commitIndex[%v]", mr.Any2String(rf.log), index, rf.commitIndex)
+	DPrintf("node: %v role: %v log: %v, index: %v commitIndex[%v]", rf.me, rf.role, mr.Any2String(rf.logs), index, rf.commitIndex)
 	rf.persist()
 	reply.Success = true
 }
@@ -423,6 +418,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	DPrintf("application enter to raft, command: %v, node[%v] term[%d] role[%v]", mr.Any2String(command), rf.me, rf.term, rf.role)
 	if rf.role != Leader {
 		return -1, -1, false
@@ -432,7 +428,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		LogIndex: rf.lastLogIndex() + 1,
 		Command:  command,
 	}
-	rf.log = append(rf.log, entry)
+	rf.logs = append(rf.logs, entry)
 	index = entry.LogIndex
 	term = entry.LogTerm
 	rf.persist()
@@ -481,9 +477,9 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 					rf.lastApplied++
 					applyMsgs = append(applyMsgs, ApplyMsg{
 						CommandValid: true,
-						Command:      rf.log[rf.lastApplied].Command,
-						CommandIndex: int(rf.log[rf.lastApplied].LogIndex),
-						CommandTerm:  int(rf.log[rf.lastApplied].LogTerm),
+						Command:      rf.logs[rf.lastApplied].Command,
+						CommandIndex: int(rf.logs[rf.lastApplied].LogIndex),
+						CommandTerm:  int(rf.logs[rf.lastApplied].LogTerm),
 					})
 				}
 			}()
@@ -561,25 +557,24 @@ func (rf *Raft) appendEntriesLoop() {
 			}
 			//记录每个node本次发送日志的前一条日志
 			prevLogIndex := rf.nextIndex[i] - 1
-			DPrintf("prevLogIndex[%v]", prevLogIndex)
 			argsI := &AppendEntriesArgs{
 				Term:                rf.term,
 				LeaderId:            rf.me,
 				LeaderCommitedIndex: rf.commitIndex,
-				PrevLogIndex:        int(prevLogIndex),
-				PrevLogTerm:         rf.log[prevLogIndex].LogTerm,
+				PrevLogIndex:        prevLogIndex,
+				PrevLogTerm:         rf.logs[prevLogIndex].LogTerm,
 			}
 			if c.Type == AppendEntryLogType {
 				argsI.LogEntries = make([]*LogEntry, 0)
 				//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
-				argsI.LogEntries = append(argsI.LogEntries, rf.log[rf.nextIndex[i]:lastLogIndex+1]...)
+				argsI.LogEntries = append(argsI.LogEntries, rf.logs[rf.nextIndex[i]:lastLogIndex+1]...)
 			}
 
 			go func(server int, args *AppendEntriesArgs) {
 				reply := &AppendEntriesReply{}
-				defer func() {
-					DPrintf("args: %v reply: %v", mr.Any2String(args), mr.Any2String(reply))
-				}()
+				//defer func() {
+				//	DPrintf("args: %v reply: %v", mr.Any2String(args), mr.Any2String(reply))
+				//}()
 				ok := rf.sendAppendEntries(server, args, reply)
 				if !ok {
 					resultChan <- &AppendEntriesResult{
@@ -655,7 +650,7 @@ func (rf *Raft) appendEntriesLoop() {
 		})
 		//本次复制的数据
 		if lastLogIndex > rf.commitIndex {
-			rf.matchIndex[rf.me] = int(lastLogIndex)
+			rf.matchIndex[rf.me] = lastLogIndex
 		}
 		newCommitIndex := matchIndexs[rf.nPeers/2]
 		if newCommitIndex > rf.commitIndex {
@@ -772,16 +767,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("starting new raft node, id: %d", me)
 	//超时设置
 
-	rf.log = make([]*LogEntry, 0)
+	rf.logs = make([]*LogEntry, 0)
 	rf.nextIndex = make([]int, rf.nPeers)
 	rf.matchIndex = make([]int, rf.nPeers)
 	for i := 0; i < rf.nPeers; i++ {
 		rf.nextIndex[i] = 1
 	}
-	rf.log = append(rf.log, &LogEntry{
+	rf.logs = append(rf.logs, &LogEntry{
 		LogTerm:  0,
 		LogIndex: 0,
-		Command:  nil,
+		Command:  100,
 	})
 
 	// initialize from state persisted before a crash
