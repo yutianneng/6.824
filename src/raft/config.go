@@ -10,7 +10,6 @@ package raft
 
 import (
 	"6.824/labgob"
-	"6.824/mr"
 )
 import "6.824/labrpc"
 import "bytes"
@@ -506,7 +505,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
-		fmt.Printf("cfg.logs: %v\n", mr.Any2String(cfg.logs))
+		//fmt.Printf("cfg.logs: %v\n", mr.Any2String(cfg.logs))
 		cfg.mu.Unlock()
 
 		if ok {
@@ -579,7 +578,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			cfg.mu.Unlock()
 			if rf != nil {
-				fmt.Printf("connected: %v, raft: %v\n", mr.Any2String(cfg.connected), mr.Any2String(rf))
+				//fmt.Printf("connected: %v, raft: %v\n", mr.Any2String(cfg.connected), mr.Any2String(rf))
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
@@ -587,7 +586,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 			}
 		}
-		fmt.Printf("cfg index: %v\n", index)
+		//fmt.Printf("cfg index: %v\n", index)
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
@@ -610,7 +609,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	fmt.Printf("cfg.logs: %v\n", mr.Any2String(cfg.logs))
+	//fmt.Printf("cfg.logs: %v\n", mr.Any2String(cfg.logs))
 	if cfg.checkFinished() == false {
 		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	}

@@ -285,9 +285,10 @@ func TestFailAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
+	fmt.Printf("TestFailAgree2B begin...\n")
 
 	cfg.begin("Test (2B): agreement after follower reconnects")
-
+	//写入一条数据
 	cfg.one(101, servers, false)
 
 	// disconnect one follower from the network.
@@ -320,7 +321,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
-	cfg.begin("Test (2B): no agreement if too many followers disconnect")
+	cfg.begin("Test (2B) TestFailNoAgree2B: no agreement if too many followers disconnect")
 
 	cfg.one(10, servers, false)
 
