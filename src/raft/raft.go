@@ -462,6 +462,7 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 
 	for !rf.killed() {
 		time.Sleep(time.Millisecond * 10)
+		applyMsgs := make([]ApplyMsg, 0)
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
@@ -470,7 +471,6 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 			if rf.lastApplied >= rf.commitIndex {
 				return
 			}
-			applyMsgs := make([]ApplyMsg, 0)
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
 				applyMsgs = append(applyMsgs, ApplyMsg{
@@ -479,14 +479,14 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 					CommandIndex: rf.lastApplied,
 				})
 			}
-			go func() {
-				//锁外提交给应用
-				for i := 0; i < len(applyMsgs); i++ {
-					DPrintf("id[%v] role[%v] upload log to application, lastApplied[%d], commitIndex[%d]", rf.me, rf.role, applyMsgs[i].CommandIndex, rf.commitIndex)
+		}()
+		go func() {
+			//锁外提交给应用
+			for i := 0; i < len(applyMsgs); i++ {
+				DPrintf("id[%v] role[%v] upload log to application, lastApplied[%d], commitIndex[%d]", rf.me, rf.role, applyMsgs[i].CommandIndex, rf.commitIndex)
 
-					applyCh <- applyMsgs[i]
-				}
-			}()
+				applyCh <- applyMsgs[i]
+			}
 		}()
 	}
 }
@@ -495,6 +495,8 @@ func (rf *Raft) electionLoop() {
 		//leader结点只是空循环，不做实际操作
 		time.Sleep(time.Millisecond * 1)
 		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			if rf.role == Leader {
 				return
 			}
@@ -503,38 +505,35 @@ func (rf *Raft) electionLoop() {
 				//不超时不需要进入下一步，只需要接收RequestVote和AppendEntries请求即可
 				return
 			}
-			rf.mu.Lock()
 			if rf.role == Follower {
 				rf.role = Candidate
 			}
 			DPrintf("become candidate... node[%v] term[%v] role[%v] lastActiveTime[%v], timeoutInterval[%d], now[%v]", rf.me, rf.term, rf.role, rf.lastActiveTime.UnixMilli(), rf.timeoutInterval.Milliseconds(), time.Now().Sub(rf.lastActiveTime).Milliseconds())
 			rf.votedFor = rf.me
 			rf.term++
+			rf.lastActiveTime = time.Now()
+			rf.timeoutInterval = randElectionTimeout()
 			rf.persist()
 			lastLogTerm, lastLogIndex := rf.lastLogTermAndLastLogIndex()
 			rf.mu.Unlock()
 			maxTerm, voteGranted := rf.becomeCandidate(lastLogTerm, lastLogIndex)
+			rf.mu.Lock()
 			//在这过程中接收到更大term的请求，导致退化为follower
 			if rf.role != Candidate {
 				return
 			}
-			rf.mu.Lock()
-			rf.lastActiveTime = time.Now()
-			rf.lastHeartBeatTime = time.Now()
-			rf.timeoutInterval = randElectionTimeout()
 			if maxTerm > rf.term {
 				rf.role = Follower
 				rf.term = maxTerm
 				rf.votedFor = RoleNone
 				rf.leaderId = RoleNone
+				rf.persist()
 			} else if voteGranted > rf.nPeers/2 {
 				rf.lastHeartBeatTime = time.Unix(0, 0)
-				rf.role = Leader
 				rf.leaderId = rf.me
+				rf.role = Leader
 			}
 			DPrintf("node[%d] role[%v] maxTerm[%d] voteGranted[%d] nPeers[%d]", rf.me, rf.role, maxTerm, voteGranted, rf.nPeers)
-			rf.persist()
-			rf.mu.Unlock()
 		}()
 	}
 }
@@ -589,9 +588,9 @@ func (rf *Raft) becomeCandidate(lastLogIndex, lastLogTerm int) (int, int) {
 					maxTerm = vote.resp.Term
 				}
 			}
-			if voteGranted > rf.nPeers/2 || totalVote == rf.nPeers {
-				return maxTerm, voteGranted
-			}
+		}
+		if voteGranted > rf.nPeers/2 || totalVote == rf.nPeers {
+			return maxTerm, voteGranted
 		}
 	}
 	return maxTerm, voteGranted
