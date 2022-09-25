@@ -55,7 +55,6 @@ func TestInitialElection2A(t *testing.T) {
 }
 
 func TestReElection2A(t *testing.T) {
-	fmt.Printf("TestReElection2A\n")
 
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -66,6 +65,7 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	//fmt.Printf("leader1[%v], disconnecting\n", leader1)
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
@@ -100,7 +100,6 @@ func TestManyElections2A(t *testing.T) {
 	servers := 7
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
-	fmt.Printf("Test (2A): multiple elections\n")
 
 	cfg.begin("Test (2A): multiple elections")
 
@@ -285,7 +284,6 @@ func TestFailAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
-	fmt.Printf("TestFailAgree2B begin...\n")
 
 	cfg.begin("Test (2B): agreement after follower reconnects")
 	//写入一条数据
