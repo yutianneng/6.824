@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"6.824/labgob"
 	"6.824/mr"
+	"bytes"
 	"math/rand"
 	"sort"
 	"time"
@@ -176,7 +178,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Success bool
 	Term    int
-	Msg     string
+	//用于探测日志匹配点
+	NextIndex int
+	Msg       string
 }
 
 // return currentTerm and whether this server
@@ -193,17 +197,39 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+//外层加锁，内层不能够再加锁了
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	//持久化当前term以及是否给其他结点投过票，避免同一个term多次投票的情况
+	e.Encode(rf.term)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.leaderId)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
+//
+// restore previously persisted state.
+//
+//一般刚刚启动时执行
+func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	rf.mu.Lock()
+	d.Decode(&rf.term)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.leaderId)
+	d.Decode(&rf.logs)
+	rf.mu.Unlock()
+}
 func (rf *Raft) lastLogTermAndLastLogIndex() (int, int) {
 	logIndex := len(rf.logs) - 1
 	logTerm := rf.logs[logIndex].LogTerm
@@ -215,28 +241,6 @@ func (rf *Raft) lastLogIndex() int {
 }
 func (rf *Raft) logTerm(logIndex int) int {
 	return rf.logs[logIndex].LogTerm
-}
-
-//
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 }
 
 //
@@ -288,9 +292,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		//需要比较最新一条日志的情况再决定要不要投票
 		rf.votedFor = RoleNone
 		rf.leaderId = RoleNone
-		//rf.lastActiveTime = time.Now()
-		//rf.lastHeartBeatTime = time.Now()
-		//rf.timeoutInterval = randElectionTimeout()
 		rf.persist()
 	}
 	//避免重复投票
@@ -337,7 +338,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.votedFor = args.LeaderId
 	rf.lastActiveTime = time.Now()
 	//还缺少前面的日志或者前一条日志匹配不上
-	if args.PrevLogIndex > rf.lastLogIndex() || args.PrevLogTerm != rf.logTerm(args.PrevLogIndex) {
+	if args.PrevLogIndex > rf.lastLogIndex() {
+		reply.NextIndex = rf.lastLogIndex()
+		return
+	}
+	//前一条日志的任期不匹配，找到冲突term首次出现的地方
+	if args.PrevLogTerm != rf.logTerm(args.PrevLogIndex) {
+		index := args.PrevLogIndex
+		term := rf.logTerm(index)
+		for ; index > 0 && rf.logTerm(index) == term; index-- {
+		}
+		reply.NextIndex = index
 		return
 	}
 	//args.PrevLogIndex<=lastLogIndex，有可能发生截断的情况
@@ -345,14 +356,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logs = rf.logs[:args.PrevLogIndex+1]
 	}
 	rf.logs = append(rf.logs, args.LogEntries...)
-	rf.persist()
 	if args.LeaderCommitedIndex > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommitedIndex
 		if rf.lastLogIndex() < rf.commitIndex {
 			rf.commitIndex = rf.lastLogIndex()
 		}
 	}
+	rf.matchIndex[rf.me] = rf.lastLogIndex()
+	rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
+	rf.persist()
 	reply.Success = true
+	reply.NextIndex = rf.nextIndex[rf.me]
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -381,6 +395,12 @@ func (rf *Raft) heartBeatLoop() {
 				//DPrintf("lastLogIndex: %v, logs: %v", lastLogIndex, mr.Any2String(rf.logs))
 				//记录每个node本次发送日志的前一条日志
 				prevLogIndex := rf.matchIndex[i]
+				if prevLogIndex > rf.lastLogIndex() {
+					prevLogIndex = rf.lastLogIndex()
+				}
+				//有可能follower的matchIndex比leader还大，此时要担心是否越界
+				//fmt.Printf("node[%d] role[%v] term[%d] lastLogIndex[%d] matchIndex[%d], log: %v\n", rf.me, rf.role, rf.term, rf.lastLogIndex(), rf.matchIndex[i], mr.Any2String(rf.logs))
+				//fmt.Printf("node[%d] role[%v] term[%d] matchIndex: %v\n", rf.me, rf.role, rf.term, mr.Any2String(rf.matchIndex))
 				argsI := &AppendEntriesArgs{
 					LogType:             HeartBeatLogType,
 					Term:                rf.term,
@@ -396,7 +416,7 @@ func (rf *Raft) heartBeatLoop() {
 					argsI.LogType = AppendEntryLogType
 					argsI.LogEntries = make([]*LogEntry, 0)
 					//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
-					argsI.LogEntries = append(argsI.LogEntries, rf.logs[rf.nextIndex[i]:lastLogIndex+1]...)
+					argsI.LogEntries = append(argsI.LogEntries, rf.logs[rf.nextIndex[i]:]...)
 				}
 
 				go func(server int, args *AppendEntriesArgs) {
@@ -421,7 +441,7 @@ func (rf *Raft) heartBeatLoop() {
 						return
 					}
 					if reply.Success {
-						rf.nextIndex[server] += len(args.LogEntries)
+						rf.nextIndex[server] = reply.NextIndex
 						rf.matchIndex[server] = rf.nextIndex[server] - 1
 						//提交到哪个位置需要根据中位数来判断，中位数表示过半提交的日志位置，
 						//每次提交日志向各结点发送的日志并不完全一样，不能光靠是否发送成功来判断
@@ -432,20 +452,23 @@ func (rf *Raft) heartBeatLoop() {
 						sort.Slice(matchIndexSlice, func(i, j int) bool {
 							return matchIndexSlice[i] < matchIndexSlice[j]
 						})
-						//fmt.Printf("matchIndexSlice: %v, newcommitIndex: %v\n", mr.Any2String(matchIndexSlice), matchIndexSlice[rf.nPeers/2])
+						//fmt.Printf("matchIndexSlice: %v, newcommitIndex: %v, lastLogIndex: %v\n", mr.Any2String(matchIndexSlice), matchIndexSlice[rf.nPeers/2], rf.lastLogIndex())
 						newCommitIndex := matchIndexSlice[rf.nPeers/2]
 						//不能提交不属于当前term的日志
 						if newCommitIndex > rf.commitIndex && rf.logs[newCommitIndex].LogTerm == rf.term {
 							DPrintf("id[%d] role[%v] commitIndex %v update to newcommitIndex %v, command: %v", rf.me, rf.role, rf.commitIndex, newCommitIndex, rf.logs[newCommitIndex])
-							rf.commitIndex = newCommitIndex
+							//如果commitIndex比自己实际的日志长度还大，这时需要减小
+							if newCommitIndex > rf.lastLogIndex() {
+								rf.commitIndex = rf.lastLogIndex()
+							} else {
+								rf.commitIndex = newCommitIndex
+							}
 						}
 					} else {
 						//follower缺少的之前的日志，探测缺少的位置
 						//后退策略，可以按term探测，也可以二分，此处采用线性探测，简单一些
-						rf.nextIndex[server] -= 1
-						if rf.nextIndex[server] < 1 {
-							rf.nextIndex[server] = 1
-						}
+						rf.nextIndex[server] = reply.NextIndex
+						rf.matchIndex[server] = reply.NextIndex - 1
 					}
 				}(i, argsI)
 			}
@@ -518,7 +541,7 @@ func (rf *Raft) electionLoop() {
 
 			//在这过程中接收到更大term的请求，导致退化为follower
 			if rf.role != Candidate {
-				//DPrintf("node[%d] role[%v] failed to leader, voteGranted[%d], totalVote[%d]", rf.me, rf.role, voteGranted, totalVote)
+				DPrintf("node[%d] role[%v] failed to leader, voteGranted[%d]", rf.me, rf.role, voteGranted)
 				return
 			}
 			if maxTerm > rf.term {
@@ -531,6 +554,7 @@ func (rf *Raft) electionLoop() {
 				rf.leaderId = rf.me
 				rf.role = Leader
 				rf.lastActiveTime = time.Unix(0, 0)
+				rf.persist()
 			}
 			DPrintf("node[%d] role[%v] maxTerm[%d] voteGranted[%d] nPeers[%d]", rf.me, rf.role, maxTerm, voteGranted, rf.nPeers)
 		}()
@@ -609,7 +633,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.logs = append(rf.logs, entry)
 	index := rf.lastLogIndex()
-	term := rf.logTerm(index)
+	term := rf.term
 	//写入后立刻持久化
 	rf.persist()
 	DPrintf("node[%d] term[%d] role[%v] add entry: %v, logIndex[%d]", rf.me, rf.term, rf.role, mr.Any2String(entry), index)
