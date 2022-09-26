@@ -339,7 +339,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastActiveTime = time.Now()
 	//还缺少前面的日志或者前一条日志匹配不上
 	if args.PrevLogIndex > rf.lastLogIndex() {
-		reply.NextIndex = rf.lastLogIndex()
+		reply.NextIndex = rf.lastLogIndex() + 1
 		return
 	}
 	//前一条日志的任期不匹配，找到冲突term首次出现的地方
@@ -348,7 +348,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		term := rf.logTerm(index)
 		for ; index > 0 && rf.logTerm(index) == term; index-- {
 		}
-		reply.NextIndex = index
+		reply.NextIndex = index + 1
 		return
 	}
 	//args.PrevLogIndex<=lastLogIndex，有可能发生截断的情况
