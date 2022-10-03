@@ -149,6 +149,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 			err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
 				m.CommandIndex, i, m.Command, j, old)
 		}
+		//fmt.Printf("node[%d] command: %v\n", j, mr.Any2String(cfg.logs[j][m.CommandIndex]))
 	}
 	_, prevok := cfg.logs[i][m.CommandIndex-1]
 	cfg.logs[i][m.CommandIndex] = v
@@ -569,6 +570,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	for time.Since(t0).Seconds() < 10 && cfg.checkFinished() == false {
 		// try all the servers, maybe one is the leader.
 		index := -1
+		//向leader写入cmd
 		for si := 0; si < cfg.n; si++ {
 			starts = (starts + 1) % cfg.n
 			var rf *Raft
@@ -578,21 +580,21 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			cfg.mu.Unlock()
 			if rf != nil {
-				//fmt.Printf("connected: %v, raft: %v\n", mr.Any2String(cfg.connected), mr.Any2String(rf))
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
+					//fmt.Printf("cfg index: %v, node[%d] \n", index, starts)
 					break
 				}
 			}
 		}
-		//fmt.Printf("cfg index: %v\n", index)
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				//fmt.Printf("nd[%d] cmd: %v\n", nd, cmd1)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
@@ -609,7 +611,10 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	//fmt.Printf("cfg.logs: %v\n", mr.Any2String(cfg.logs))
+	//for k, v := range cfg.logs {
+	//	fmt.Printf("node[%d] cfg.logs: %v\n", k, mr.Any2String(v))
+	//}
+
 	if cfg.checkFinished() == false {
 		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	}
