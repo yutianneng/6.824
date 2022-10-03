@@ -86,7 +86,7 @@ type Raft struct {
 	lastApplied int
 
 	lastIncludeIndex int //快照的最大logIndex
-	lastIncludeTerm  int
+	lastIncludeTerm  int //最后一条压缩日志的term，不是压缩时node's term
 	snapshotOffset   int //快照可能分批次传输
 	snapshot         []byte
 
@@ -193,13 +193,12 @@ type InstallSnapshotArgs struct {
 	LeaderId         int
 	LastIncludeIndex int //snapshot中最后一条日志的index
 	LastIncludeTerm  int
-	Offset           int //此次传输chunk在快照文件的偏移量，快照文件可能很大，因此需要分chunk
 	Data             []byte
-	Done             bool //是否最后一块
+	//Offset           int //此次传输chunk在快照文件的偏移量，快照文件可能很大，因此需要分chunk，此次不分片
+	//Done             bool //是否最后一块
 }
 type InstallSnapshotReply struct {
-	Success bool
-	Term    int
+	Term int
 }
 
 // return currentTerm and whether this server
@@ -296,7 +295,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	logs := rf.logs[0:1]
 	logs[0].LogTerm = lastIncludedTerm
 	//本结点最后一条日志在快照点之前，太落后，清空，应用快照，否则截断
-	if lastIncludedIndex < rf.lastLogIndex() {
+	if rf.lastLogIndex() > lastIncludedIndex {
 		logs = append(logs, rf.logs[lastIncludedIndex-rf.lastIncludeIndex+1:]...)
 	}
 	rf.logs = logs
@@ -313,7 +312,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 
 //接收来自leader的快照，并上传给应用层，通过applyCh写入
 //这个函数只是follower为了赶上leader状态的，
-//如果是为了压缩日志，只需要自己独立压缩就行，不需要完全leader
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 
 	rf.mu.Lock()
@@ -321,9 +319,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer func() {
 		DPrintf("process InstallSnapshot node[%v] term[%v] lastLogIndex[%d] lastLogTerm[%d] lastIncludeIndex[%d] commitIndex[%d]  received InstallSnapshot, args: %v, reply: %v", rf.me, rf.term, rf.lastLogIndex(), rf.logTerm(rf.lastLogIndex()-rf.lastIncludeIndex), rf.lastIncludeIndex, rf.commitIndex, mr.Any2String(args), mr.Any2String(reply))
 	}()
-	reply.Success = false
 	reply.Term = rf.term
 	if rf.term > args.Term || args.Data == nil {
+		DPrintf("InstallSnapshot node[%d] term[%d] from node[%d] term[%d], rf.term > args.Term delined, args: %v, reply: %v ", rf.me, rf.term, args.LeaderId, args.Term, mr.Any2String(args), mr.Any2String(reply))
 		return
 	}
 	if rf.term < args.Term {
@@ -336,11 +334,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastActiveTime = time.Now()
 	//只有缺少的数据在快照点之前时才需要快照
 	if rf.commitIndex >= args.LastIncludeIndex {
+		DPrintf("InstallSnapshot node[%d] term[%d] from node[%d] term[%d], commitIndex[%d], rf.commitIndex >= args.LastIncludeIndex delined, args: %v, reply: %v ", rf.me, rf.term, args.LeaderId, args.Term, rf.commitIndex, mr.Any2String(args), mr.Any2String(reply))
+
 		return
 	}
 	//接收快照并持久化，至于应用到状态机可以异步做，就算意外下线，也是从日志和快照恢复
 	//
-	reply.Success = true
 	//不能立刻应用快照，需要保证raft和状态机都应用快照成功，放到CondInstallSnapshot中应用
 	applyMsg := ApplyMsg{
 		SnapshotValid: true,
@@ -358,20 +357,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if index <= rf.lastIncludeIndex || index < rf.lastApplied {
+	if index <= rf.lastIncludeIndex || index != rf.lastApplied || index > rf.lastLogIndex() {
 		return
 	}
 	DPrintf("node[%d] role[%d] term[%d] snapshoting, index[%d] commitIndex[%d] lastApplied[%d]", rf.me, rf.role, rf.term, index, rf.commitIndex, rf.lastApplied)
 	logs := rf.logs[0:1]
-	logs[0].LogTerm = rf.term
+	logs[0].LogTerm = rf.logs[index-rf.lastIncludeIndex].LogTerm
 	//本结点最后一条日志在快照点之前，太落后，清空，应用快照，否则截断
-	if index < rf.lastLogIndex() {
-		logs = append(logs, rf.logs[index-rf.lastIncludeIndex+1:]...)
-	}
+	logs = append(logs, rf.logs[index-rf.lastIncludeIndex+1:]...)
 	rf.logs = logs
 	rf.snapshot = snapshot
 	rf.lastIncludeIndex = index
-	rf.lastIncludeTerm = rf.term
+	rf.lastIncludeTerm = logs[0].LogTerm
 	rf.persister.SaveStateAndSnapshot(rf.encodeRaftState(), snapshot)
 }
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -391,7 +388,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer func() {
-		DPrintf("node[%d] role[%v] received vote from node[%d], now[%d], args: %v, reply: %v", rf.me, rf.role, args.CandidateId, time.Now().UnixMilli(), mr.Any2String(args), mr.Any2String(reply))
+		DPrintf("node[%d] role[%v] received vote request from node[%d], now[%d], args: %v, reply: %v", rf.me, rf.role, args.CandidateId, time.Now().UnixMilli(), mr.Any2String(args), mr.Any2String(reply))
 	}()
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
@@ -431,14 +428,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
-		DPrintf("process AppendEntries node[%d] role[%v] args: %v, reply: %v", rf.me, rf.role, mr.Any2String(args), mr.Any2String(reply))
+		DPrintf("process AppendEntries node[%d] role[%v] from node[%d] term[%d] args: %v, reply: %v", rf.me, rf.role, args.LeaderId, args.Term, mr.Any2String(args), mr.Any2String(reply))
 	}()
 
 	reply.Term = rf.term
 	reply.Success = false
 	//拒绝旧leader请求
 	if args.Term < rf.term {
-		//DPrintf("node[%v] term[%d] receive appendEntries from node[%v] term[%d], declined", rf.me, rf.term, args.LeaderId, args.Term)
+		DPrintf("appendEntries node[%v] term[%d] from node[%v] term[%d], args.Term < rf.term declined", rf.me, rf.term, args.LeaderId, args.Term)
 		return
 	}
 	//发现一个更大的任期，转变成这个term的follower，leader、follower--> follower
@@ -455,15 +452,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastActiveTime = time.Now()
 	//还缺少前面的日志或者前一条日志匹配不上
 	if args.PrevLogIndex > rf.lastLogIndex() {
-		//DPrintf("node[%d] term[%d] lastLogIndex[%d] receive appendEntries from node[%d], args: %v reply: %v ", rf.me, rf.term, rf.lastLogIndex(), args.LeaderId, mr.Any2String(args), mr.Any2String(reply))
 		reply.NextIndex = rf.lastLogIndex() + 1
+		DPrintf("appendEntries node[%d] term[%d] lastLogIndex[%d] from node[%d], args.PrevLogIndex > rf.lastLogIndex() declined, args: %v reply: %v ", rf.me, rf.term, rf.lastLogIndex(), args.LeaderId, mr.Any2String(args), mr.Any2String(reply))
 		return
 	}
 	//本peer压缩过，不能再往前探测，压缩的日志一定是已经提交的日志
 	if args.PrevLogIndex < rf.lastIncludeIndex {
-		reply.NextIndex = rf.lastIncludeIndex
+		reply.NextIndex = rf.lastIncludeIndex + 1
 		//nextIndex向后移动了就算success
-		reply.Success = true
+		reply.Success = false
 		return
 	}
 	if args.PrevLogTerm != rf.logTerm(args.PrevLogIndex-rf.lastIncludeIndex) {
@@ -473,7 +470,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for ; index > 0 && rf.logTerm(index) == term; index-- {
 		}
 		reply.NextIndex = index + 1 + rf.lastIncludeIndex
-		DPrintf("node[%v] term[%d] receive appendEntries from node[%v] term[%d], declined", rf.me, rf.term, args.LeaderId, args.Term)
+		DPrintf("AppendEntries node[%v] term[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]  from node[%v] term[%d], args.PrevLogTerm != rf.logTerm(args.PrevLogIndex-rf.lastIncludeIndex) declined, reply: %v, args: %v", rf.me, rf.term, rf.lastIncludeIndex, rf.lastIncludeTerm, args.LeaderId, args.Term, mr.Any2String(reply), mr.Any2String(args))
 		return
 	}
 	//args.PrevLogIndex<=lastLogIndex，有可能发生截断的情况
@@ -515,7 +512,7 @@ func (rf *Raft) heartBeatLoop() {
 			rf.lastActiveTime = time.Now()
 			rf.matchIndex[rf.me] = rf.lastLogIndex()
 			rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
-			DPrintf("node[%d] role[%v] term[%d] lastLogIndex[%v] matchIndex[%v], commitIndex[%d] log: %v\n", rf.me, rf.role, rf.term, rf.lastLogIndex(), mr.Any2String(rf.matchIndex), rf.commitIndex, mr.Any2String(rf.logs))
+			//DPrintf("heartBeatLoop node[%d] role[%v] term[%d] lastLogIndex[%v] matchIndex[%v], commitIndex[%d] log: %v\n", rf.me, rf.role, rf.term, rf.lastLogIndex(), mr.Any2String(rf.matchIndex), rf.commitIndex, mr.Any2String(rf.logs))
 			for i := 0; i < rf.nPeers; i++ {
 				if rf.me == i {
 					continue
@@ -527,15 +524,10 @@ func (rf *Raft) heartBeatLoop() {
 						LeaderId:         rf.me,
 						LastIncludeIndex: rf.lastIncludeIndex,
 						LastIncludeTerm:  rf.lastIncludeTerm,
-						Offset:           0,
 						Data:             rf.snapshot,
-						Done:             true,
 					}
 					go func(server int, args *InstallSnapshotArgs) {
 						reply := &InstallSnapshotReply{}
-						defer func() {
-							DPrintf("InstallSnapshot from id[%d] role[%v] to id[%d], args: %v, reply: %v", rf.me, rf.role, server, mr.Any2String(args), mr.Any2String(reply))
-						}()
 						ok := rf.sendInstallSnapshot(server, args, reply)
 						if !ok {
 							return
@@ -586,7 +578,7 @@ func (rf *Raft) heartBeatLoop() {
 					}
 					//发送日志
 					//有可能follower的matchIndex比leader还大，此时要担心是否越界
-					//DPrintf("AppendEntries node[%d] role[%v] term[%d] lastLogIndex[%d] matchIndex[%v], lastSnapshotIndex[%v], log: %v\n", rf.me, rf.role, rf.term, rf.lastLogIndex(), mr.Any2String(rf.matchIndex), rf.lastIncludeIndex, mr.Any2String(rf.logs))
+					//DPrintf("sendAppendEntries node[%d] role[%v] term[%d] lastLogIndex[%d] matchIndex[%v], lastSnapshotIndex[%v], log: %v\n", rf.me, rf.role, rf.term, rf.lastLogIndex(), mr.Any2String(rf.matchIndex), rf.lastIncludeIndex, mr.Any2String(rf.logs))
 					argsI := &AppendEntriesArgs{
 						LogType:             HeartBeatLogType,
 						Term:                rf.term,
@@ -600,7 +592,7 @@ func (rf *Raft) heartBeatLoop() {
 					if rf.matchIndex[i] < rf.lastLogIndex() {
 						argsI.LogType = AppendEntryLogType
 						argsI.LogEntries = make([]*LogEntry, 0)
-						//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
+						//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能达到过半提交的效果
 						argsI.LogEntries = append(argsI.LogEntries, rf.logs[rf.nextIndex[i]-rf.lastIncludeIndex:]...)
 					}
 
@@ -625,9 +617,11 @@ func (rf *Raft) heartBeatLoop() {
 							rf.persist()
 							return
 						}
+						//follower缺少的之前的日志，探测缺少的位置
+						//后退策略，可以按term探测，也可以二分，此处采用线性探测，简单一些
+						rf.nextIndex[server] = reply.NextIndex
+						rf.matchIndex[server] = reply.NextIndex - 1
 						if reply.Success {
-							rf.nextIndex[server] = reply.NextIndex
-							rf.matchIndex[server] = rf.nextIndex[server] - 1
 							//提交到哪个位置需要根据中位数来判断，中位数表示过半提交的日志位置，
 							//每次提交日志向各结点发送的日志并不完全一样，不能光靠是否发送成功来判断
 							matchIndexSlice := make([]int, rf.nPeers)
@@ -640,7 +634,7 @@ func (rf *Raft) heartBeatLoop() {
 							//fmt.Printf("matchIndexSlice: %v, newcommitIndex: %v, lastLogIndex: %v\n", mr.Any2String(matchIndexSlice), matchIndexSlice[rf.nPeers/2], rf.lastLogIndex())
 							newCommitIndex := matchIndexSlice[rf.nPeers/2]
 							//不能提交不属于当前term的日志
-							//DPrintf("id[%d] role[%v] appendEntries, commitIndex %v update to newcommitIndex %v, lastSnapshotIndex %v,  command: %v, matchIndex: %v\n", rf.me, rf.role, rf.commitIndex, newCommitIndex, rf.lastIncludeIndex, 0, mr.Any2String(rf.matchIndex))
+							DPrintf("sengAppendEntries id[%d] role[%v] appendEntries to node[%d] , lastLogIndex %v commitIndex %v update to newcommitIndex %v, lastSnapshotIndex %v, lastSnapshotTerm %d,  command: %v, matchIndex: %v\n", rf.me, rf.role, server, rf.lastLogIndex(), rf.commitIndex, newCommitIndex, rf.lastIncludeIndex, rf.lastIncludeTerm, 0, mr.Any2String(rf.matchIndex))
 							//只能往大更新
 							if newCommitIndex > rf.commitIndex && rf.logTerm(newCommitIndex-rf.lastIncludeIndex) == rf.term {
 								//如果commitIndex比自己实际的日志长度还大，这时需要减小
@@ -650,11 +644,6 @@ func (rf *Raft) heartBeatLoop() {
 									rf.commitIndex = newCommitIndex
 								}
 							}
-						} else {
-							//follower缺少的之前的日志，探测缺少的位置
-							//后退策略，可以按term探测，也可以二分，此处采用线性探测，简单一些
-							rf.nextIndex[server] = reply.NextIndex
-							rf.matchIndex[server] = reply.NextIndex - 1
 						}
 					}(i, argsI)
 				}
