@@ -1,13 +1,18 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"6.824/mr"
+	"sync"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	mu              sync.Mutex
+	servers         []*labrpc.ClientEnd
+	lastRpcServerId int
 }
 
 func nrand() int64 {
@@ -20,7 +25,8 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.lastRpcServerId = 0
+	ck.mu = sync.Mutex{}
 	return ck
 }
 
@@ -38,8 +44,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 
-	// You will have to modify this function.
-	return ""
+	args := &GetArgs{Key: key}
+	reply := &GetReply{}
+	defer func() {
+		DPrintf("client Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+	}()
+	ok := ck.servers[ck.lastRpcServerId].Call("KVServer.Get", args, reply)
+	if !ok {
+		return ""
+	}
+	return reply.Value
 }
 
 //
@@ -54,6 +68,34 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+
+	args := &PutAppendArgs{
+		Key:   key,
+		Value: value,
+		Op:    op,
+	}
+	reply := &PutAppendReply{}
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	for {
+		for i := 0; i < len(ck.servers); i++ {
+			ok := ck.servers[ck.lastRpcServerId].Call("KVServer.PutAppend", args, reply)
+			if !ok {
+				ck.lastRpcServerId++
+				ck.lastRpcServerId %= len(ck.servers)
+			} else if reply.Err == OK {
+				DPrintf("client Put, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+				return
+			} else if reply.Err == ErrWrongLeader {
+				ck.lastRpcServerId++
+				ck.lastRpcServerId %= len(ck.servers)
+			}
+		}
+		//当前可能还在选举，等待100ms
+		time.Sleep(time.Millisecond * 100)
+	}
+
 }
 
 func (ck *Clerk) Put(key string, value string) {

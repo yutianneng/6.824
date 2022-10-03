@@ -3,13 +3,17 @@ package kvraft
 import (
 	"6.824/labgob"
 	"6.824/labrpc"
+	"6.824/mr"
 	"6.824/raft"
+	"encoding/json"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +22,9 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key   string
+	Value string
 }
 
 type KVServer struct {
@@ -35,15 +37,91 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
+	proposeC chan Op           //用于线性处理client请求，发送给raft
+	kvStore  map[string]string //k-v对
 
+	applyWaitMap map[string]chan int //用于监听日志是否提交
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	defer func() {
+		DPrintf("receive Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+	}()
+	if val, ok := kv.kvStore[args.Key]; ok {
+		reply.Err = OK
+		reply.Value = val
+		return
+	}
+	reply.Err = ErrNoKey
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	defer func() {
+		DPrintf("server PutAppend, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+	}()
+	op := &Op{
+		Key:   args.Key,
+		Value: args.Value,
+	}
+	if args.Op == "Append" {
+		if v, ok := kv.kvStore[args.Key]; ok {
+			val := v + args.Value
+			op.Value = val
+		}
+	}
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	index, _, ok := kv.rf.Start(op)
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("leaderId: %v", kv.rf.LeaderId())
+	//阻塞等待
+	kv.mu.Lock()
+	wait := make(chan int, 1)
+	kv.applyWaitMap[strconv.Itoa(index)+"-"+op.Key] = wait
+	kv.mu.Unlock()
+
+	select {
+	case <-wait:
+		reply.Err = OK
+	case <-time.After(time.Second):
+		reply.Err = ErrNoKey
+	}
+	kv.mu.Lock()
+	delete(kv.applyWaitMap, strconv.Itoa(index)+"-"+op.Key)
+	kv.mu.Unlock()
+}
+func convert(command interface{}) *Op {
+
+	bytes, _ := json.Marshal(command)
+	op := &Op{}
+	json.Unmarshal(bytes, &op)
+	return op
+}
+func (kv *KVServer) applyStateMachineLoop() {
+
+	for !kv.killed() {
+
+		select {
+		case applyMsg := <-kv.applyCh:
+			if applyMsg.CommandValid {
+
+				command := convert(applyMsg.Command)
+				DPrintf("command: %v", mr.Any2String(command))
+				kv.kvStore[command.Key] = command.Value
+				//使得写入的client能够响应
+				if c, ok := kv.applyWaitMap[strconv.Itoa(applyMsg.CommandIndex)+"-"+command.Key]; ok {
+					c <- 1
+				}
+			}
+		}
+	}
 }
 
 //
@@ -90,12 +168,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.kvStore = make(map[string]string)
+	kv.applyWaitMap = make(map[string]chan int)
+
+	go kv.applyStateMachineLoop()
 
 	return kv
 }
