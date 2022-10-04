@@ -656,7 +656,7 @@ func (rf *Raft) heartBeatLoop() {
 func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 
 	for !rf.killed() {
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 1)
 		//applyMsgs := make([]ApplyMsg, 0)
 		var applyMsg *ApplyMsg
 		logSize := 0
@@ -821,6 +821,31 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//DPrintf("node[%d] term[%d] role[%v] add entry: %v, logIndex[%d]", rf.me, rf.term, rf.role, mr.Any2String(entry), index)
 	return index, term, true
 }
+
+//批量写
+//func (rf *Raft) BatchStart(commands []interface{}) (int, int, bool) {
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
+//
+//	if rf.role != Leader {
+//		return -1, -1, false
+//	}
+//	entries := make([]*LogEntry, len(commands))
+//	for i := 0; i < len(commands); i++ {
+//		entry := &LogEntry{
+//			LogTerm: rf.term,
+//			Command: commands[i],
+//		}
+//		entries[i] = entry
+//	}
+//	rf.logs = append(rf.logs, entries...)
+//	index := rf.lastLogIndex()
+//	term := rf.term
+//	//写入后立刻持久化
+//	rf.persist()
+//	//DPrintf("node[%d] term[%d] role[%v] add entry: %v, logIndex[%d]", rf.me, rf.term, rf.role, mr.Any2String(entry), index)
+//	return index, term, true
+//}
 
 //初始化raft, 所有raft的任务都要另起协程，测试文件采用的是协程模拟rpc
 func Make(peers []*labrpc.ClientEnd, me int,

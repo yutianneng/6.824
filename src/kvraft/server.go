@@ -5,9 +5,7 @@ import (
 	"6.824/labrpc"
 	"6.824/mr"
 	"6.824/raft"
-	"encoding/json"
 	"log"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,9 +20,36 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType string
+
+const (
+	OpTypeGet    = "Get"
+	OpTypePut    = "Put"
+	OpTypeAppend = "Append"
+)
+
 type Op struct {
-	Key   string
-	Value string
+	UniqueRequestId uint64
+	OpType          OpType
+	Key             string
+	Value           string
+	StartTimestamp  int64
+}
+
+type OpContext struct {
+	UniqueRequestId uint64
+	Op              *Op
+	Term            int
+	WaitCh          chan string
+}
+
+func NewOpContext(uniqueRequestId uint64, op *Op, term int) *OpContext {
+	return &OpContext{
+		UniqueRequestId: uniqueRequestId,
+		Op:              op,
+		Term:            term,
+		WaitCh:          make(chan string, 1),
+	}
 }
 
 type KVServer struct {
@@ -37,73 +62,99 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	proposeC chan Op           //用于线性处理client请求，发送给raft
+	proposeC chan *Op          //用于线性处理client请求，发送给raft
 	kvStore  map[string]string //k-v对
 
-	applyWaitMap map[string]chan int //用于监听日志是否提交
+	opContextMap   map[uint64]*OpContext //用于每个请求的上下文
+	idempotencyMap map[uint64]int64      //幂等性
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	defer func() {
-		DPrintf("receive Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
-	}()
-	if val, ok := kv.kvStore[args.Key]; ok {
-		reply.Err = OK
-		reply.Value = val
-		return
-	}
-	reply.Err = ErrNoKey
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	defer func() {
-		DPrintf("server PutAppend, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
-	}()
 	op := &Op{
-		Key:   args.Key,
-		Value: args.Value,
+		UniqueRequestId: args.UniqueRequestId,
+		OpType:          OpTypeGet,
+		Key:             args.Key,
+		StartTimestamp:  time.Now().UnixMilli(),
 	}
-	if args.Op == "Append" {
-		if v, ok := kv.kvStore[args.Key]; ok {
-			val := v + args.Value
-			op.Value = val
-		}
-	}
-	if _, isLeader := kv.rf.GetState(); !isLeader {
+	reply.LeaderId = kv.rf.LeaderId()
+	//Append不能先append然后将日志传给raft
+	term := 0
+	isLeader := false
+	if term, isLeader = kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	index, _, ok := kv.rf.Start(op)
+	start := time.Now()
+	defer func() {
+		DPrintf("server Get cost: %v, node: %v, leaderId: %d", time.Now().Sub(start).Milliseconds(), kv.me, kv.rf.LeaderId())
+	}()
+	opContext := NewOpContext(op.UniqueRequestId, op, term)
+	kv.opContextMap[op.UniqueRequestId] = opContext
+	_, _, ok := kv.rf.Start(*op)
+
+	defer func() {
+		//DPrintf("server Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		delete(kv.opContextMap, op.UniqueRequestId)
+	}()
 	if !ok {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("leaderId: %v", kv.rf.LeaderId())
 	//阻塞等待
-	kv.mu.Lock()
-	wait := make(chan int, 1)
-	kv.applyWaitMap[strconv.Itoa(index)+"-"+op.Key] = wait
-	kv.mu.Unlock()
-
 	select {
-	case <-wait:
+	case c := <-opContext.WaitCh:
 		reply.Err = OK
-	case <-time.After(time.Second):
-		reply.Err = ErrNoKey
+		reply.Value = c
+	case <-time.After(time.Millisecond * 500):
+		reply.Err = ErrTimeout
 	}
-	kv.mu.Lock()
-	delete(kv.applyWaitMap, strconv.Itoa(index)+"-"+op.Key)
-	kv.mu.Unlock()
 }
-func convert(command interface{}) *Op {
 
-	bytes, _ := json.Marshal(command)
-	op := &Op{}
-	json.Unmarshal(bytes, &op)
-	return op
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+
+	op := &Op{
+		UniqueRequestId: args.UniqueRequestId,
+		OpType:          OpType(args.Op),
+		Key:             args.Key,
+		Value:           args.Value,
+		StartTimestamp:  time.Now().UnixMilli(),
+	}
+	reply.LeaderId = kv.rf.LeaderId()
+	term := 0
+	isLeader := false
+	if term, isLeader = kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	start := time.Now()
+	defer func() {
+		DPrintf("server PutAppend cost: %v, node: %d, leaderId: %d", time.Now().Sub(start).Milliseconds(), kv.me, kv.rf.LeaderId())
+	}()
+	opContext := NewOpContext(op.UniqueRequestId, op, term)
+	kv.opContextMap[op.UniqueRequestId] = opContext
+	_, _, ok := kv.rf.Start(*op)
+	defer func() {
+		//DPrintf("server PutAppend, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		delete(kv.opContextMap, op.UniqueRequestId)
+	}()
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	//阻塞等待
+	select {
+	case <-opContext.WaitCh:
+		reply.Err = OK
+	case <-time.After(time.Millisecond * 500):
+		reply.Err = ErrTimeout
+	}
 }
+
+func (kv *KVServer) write2RaftLoop() {
+
+}
+
+//串行写状态机
 func (kv *KVServer) applyStateMachineLoop() {
 
 	for !kv.killed() {
@@ -112,12 +163,26 @@ func (kv *KVServer) applyStateMachineLoop() {
 		case applyMsg := <-kv.applyCh:
 			if applyMsg.CommandValid {
 
-				command := convert(applyMsg.Command)
-				DPrintf("command: %v", mr.Any2String(command))
-				kv.kvStore[command.Key] = command.Value
+				op := applyMsg.Command.(Op)
+				//保证幂等性
+				if _, ok := kv.idempotencyMap[op.UniqueRequestId]; ok {
+					break
+				}
+				DPrintf("op: %v, cost: %v", mr.Any2String(op), time.Now().UnixMilli()-op.StartTimestamp)
+				kv.idempotencyMap[op.UniqueRequestId] = time.Now().UnixMilli()
+				kv.mu.Lock()
+				switch op.OpType {
+				case OpTypePut:
+					kv.kvStore[op.Key] = op.Value
+				case OpTypeAppend:
+					kv.kvStore[op.Key] += op.Value
+				case OpTypeGet:
+				}
+				val := kv.kvStore[op.Key]
+				kv.mu.Unlock()
 				//使得写入的client能够响应
-				if c, ok := kv.applyWaitMap[strconv.Itoa(applyMsg.CommandIndex)+"-"+command.Key]; ok {
-					c <- 1
+				if c, ok := kv.opContextMap[op.UniqueRequestId]; ok {
+					c.WaitCh <- val
 				}
 			}
 		}
@@ -172,7 +237,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.kvStore = make(map[string]string)
-	kv.applyWaitMap = make(map[string]chan int)
+	kv.opContextMap = make(map[uint64]*OpContext)
+	kv.idempotencyMap = make(map[uint64]int64)
+	kv.proposeC = make(chan *Op, 10)
 
 	go kv.applyStateMachineLoop()
 

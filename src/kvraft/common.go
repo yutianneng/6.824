@@ -5,30 +5,35 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrPutAppend   = "ErrPutAppend"
+	ErrTimeout     = "ErrTimeout"
 )
 
 type Err string
 
 // Put or Append
 type PutAppendArgs struct {
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	UniqueRequestId uint64
+	Key             string
+	Value           string
+	Op              string // "Put" or "Append"
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err      Err
+	LeaderId int
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+	UniqueRequestId uint64
+	Key             string
 }
 
 type GetReply struct {
-	Err   Err
-	Value string
+	Err      Err
+	Value    string
+	LeaderId int
+}
+
+func UniqueRequestId(clientId int, requestId uint64) uint64 {
+	return uint64(clientId<<32) + requestId&0xffffffff
 }

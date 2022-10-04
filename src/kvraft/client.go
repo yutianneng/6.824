@@ -2,8 +2,8 @@ package kvraft
 
 import (
 	"6.824/labrpc"
-	"6.824/mr"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 import "crypto/rand"
@@ -13,6 +13,8 @@ type Clerk struct {
 	mu              sync.Mutex
 	servers         []*labrpc.ClientEnd
 	lastRpcServerId int
+	clientId        int
+	nextRequestId   uint64 //clientId<<12+nextRequestId
 }
 
 func nrand() int64 {
@@ -25,9 +27,23 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	ck.lastRpcServerId = 0
 	ck.mu = sync.Mutex{}
+	ck.lastRpcServerId = int(nrand()) % len(ck.servers)
+	ck.clientId = int(nrand() + time.Now().UnixNano())
+	ck.nextRequestId = uint64(nrand() % 1000)
 	return ck
+}
+
+func (ck *Clerk) currentRpcServerId() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	return ck.lastRpcServerId
+}
+func (ck *Clerk) setRpcServerId(rpcServerId int) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.lastRpcServerId = rpcServerId
+	ck.lastRpcServerId %= len(ck.servers)
 }
 
 //
@@ -44,16 +60,37 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 
-	args := &GetArgs{Key: key}
-	reply := &GetReply{}
+	start := time.Now()
 	defer func() {
-		DPrintf("client Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		DPrintf("client Get cost: %v", time.Now().Sub(start).Milliseconds())
 	}()
-	ok := ck.servers[ck.lastRpcServerId].Call("KVServer.Get", args, reply)
-	if !ok {
-		return ""
+	args := &GetArgs{
+		UniqueRequestId: UniqueRequestId(ck.clientId, atomic.AddUint64(&ck.nextRequestId, 1)),
+		Key:             key,
 	}
-	return reply.Value
+	reply := &GetReply{}
+	rpcServerId := ck.currentRpcServerId()
+
+	for {
+		for i := 0; i < len(ck.servers); i++ {
+			ok := ck.servers[rpcServerId].Call("KVServer.Get", args, reply)
+			//DPrintf("client Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+			if !ok {
+				rpcServerId++
+				rpcServerId %= len(ck.servers)
+			} else if reply.Err == OK {
+				return reply.Value
+			} else if reply.LeaderId != -1 {
+				rpcServerId = reply.LeaderId
+			} else {
+				rpcServerId++
+				rpcServerId %= len(ck.servers)
+			}
+			time.Sleep(time.Millisecond * 1)
+		}
+		//轮询一遍都失败了，可能正常选主中
+		//time.Sleep(time.Millisecond * 50)
+	}
 }
 
 //
@@ -67,35 +104,43 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
 
+	start := time.Now()
+	defer func() {
+		DPrintf("client Get cost: %v", time.Now().Sub(start).Milliseconds())
+	}()
 	args := &PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		UniqueRequestId: UniqueRequestId(ck.clientId, atomic.AddUint64(&ck.nextRequestId, 1)),
+		Key:             key,
+		Value:           value,
+		Op:              op,
 	}
 	reply := &PutAppendReply{}
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
+	rpcServerId := ck.currentRpcServerId()
 
 	for {
 		for i := 0; i < len(ck.servers); i++ {
-			ok := ck.servers[ck.lastRpcServerId].Call("KVServer.PutAppend", args, reply)
+			ok := ck.servers[rpcServerId].Call("KVServer.PutAppend", args, reply)
+			//DPrintf("client Put, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 			if !ok {
-				ck.lastRpcServerId++
-				ck.lastRpcServerId %= len(ck.servers)
-			} else if reply.Err == OK {
-				DPrintf("client Put, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
-				return
-			} else if reply.Err == ErrWrongLeader {
-				ck.lastRpcServerId++
-				ck.lastRpcServerId %= len(ck.servers)
-			}
-		}
-		//当前可能还在选举，等待100ms
-		time.Sleep(time.Millisecond * 100)
-	}
+				rpcServerId++
+				rpcServerId %= len(ck.servers)
 
+			} else if reply.Err == OK {
+				ck.setRpcServerId(rpcServerId)
+				//DPrintf("client Put, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+				return
+			} else if reply.LeaderId != -1 {
+				rpcServerId = reply.LeaderId
+			} else {
+				rpcServerId++
+				rpcServerId %= len(ck.servers)
+			}
+			time.Sleep(time.Millisecond * 1)
+		}
+		//轮询一遍都失败了，可能正常选主中
+		//time.Sleep(time.Millisecond * 50)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
