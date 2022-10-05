@@ -12,26 +12,26 @@ type Err string
 
 // Put or Append
 type PutAppendArgs struct {
-	UniqueRequestId uint64
-	Key             string
-	Value           string
-	Op              string // "Put" or "Append"
+	ClientId  int
+	RequestId uint64
+	Key       string
+	Value     string
+	Op        string // "Put" or "Append"
 }
 
 type PutAppendReply struct {
-	Err      Err
-	LeaderId int
+	Err Err
 }
 
 type GetArgs struct {
-	UniqueRequestId uint64
-	Key             string
+	ClientId  int
+	RequestId uint64
+	Key       string
 }
 
 type GetReply struct {
-	Err      Err
-	Value    string
-	LeaderId int
+	Err   Err
+	Value string
 }
 
 func UniqueRequestId(clientId int, requestId uint64) uint64 {

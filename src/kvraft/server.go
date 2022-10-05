@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -29,23 +29,28 @@ const (
 )
 
 type Op struct {
-	UniqueRequestId uint64
-	OpType          OpType
-	Key             string
-	Value           string
-	StartTimestamp  int64
+	ClientId       int
+	RequestId      uint64
+	OpType         OpType
+	Key            string
+	Value          string
+	StartTimestamp int64
 }
 
 type OpContext struct {
+	ClientId        int
+	RequestId       uint64
 	UniqueRequestId uint64
 	Op              *Op
 	Term            int
 	WaitCh          chan string
 }
 
-func NewOpContext(uniqueRequestId uint64, op *Op, term int) *OpContext {
+func NewOpContext(op *Op, term int) *OpContext {
 	return &OpContext{
-		UniqueRequestId: uniqueRequestId,
+		ClientId:        op.ClientId,
+		RequestId:       op.RequestId,
+		UniqueRequestId: UniqueRequestId(op.ClientId, op.RequestId),
 		Op:              op,
 		Term:            term,
 		WaitCh:          make(chan string, 1),
@@ -62,21 +67,19 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	proposeC chan *Op          //用于线性处理client请求，发送给raft
-	kvStore  map[string]string //k-v对
-
-	opContextMap   map[uint64]*OpContext //用于每个请求的上下文
-	idempotencyMap map[uint64]int64      //幂等性
+	kvStore          map[string]string     //k-v对
+	opContextMap     map[uint64]*OpContext //用于每个请求的上下文
+	lastRequestIdMap map[int]uint64        //clientId-->lastRequestId，维持幂等性，需要客户端能够保证串行
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := &Op{
-		UniqueRequestId: args.UniqueRequestId,
-		OpType:          OpTypeGet,
-		Key:             args.Key,
-		StartTimestamp:  time.Now().UnixMilli(),
+		ClientId:       args.ClientId,
+		RequestId:      args.RequestId,
+		OpType:         OpTypeGet,
+		Key:            args.Key,
+		StartTimestamp: time.Now().UnixMilli(),
 	}
-	reply.LeaderId = kv.rf.LeaderId()
 	//Append不能先append然后将日志传给raft
 	term := 0
 	isLeader := false
@@ -88,13 +91,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer func() {
 		DPrintf("server Get cost: %v, node: %v, leaderId: %d", time.Now().Sub(start).Milliseconds(), kv.me, kv.rf.LeaderId())
 	}()
-	opContext := NewOpContext(op.UniqueRequestId, op, term)
-	kv.opContextMap[op.UniqueRequestId] = opContext
+	kv.mu.Lock()
+	opContext := NewOpContext(op, term)
+	kv.opContextMap[opContext.UniqueRequestId] = opContext
+	kv.mu.Unlock()
 	_, _, ok := kv.rf.Start(*op)
 
 	defer func() {
 		//DPrintf("server Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
-		delete(kv.opContextMap, op.UniqueRequestId)
+		kv.mu.Lock()
+		delete(kv.opContextMap, opContext.UniqueRequestId)
+		kv.mu.Unlock()
 	}()
 	if !ok {
 		reply.Err = ErrWrongLeader
@@ -105,7 +112,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case c := <-opContext.WaitCh:
 		reply.Err = OK
 		reply.Value = c
-	case <-time.After(time.Millisecond * 500):
+	case <-time.After(time.Millisecond * 1000):
 		reply.Err = ErrTimeout
 	}
 }
@@ -113,45 +120,51 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	op := &Op{
-		UniqueRequestId: args.UniqueRequestId,
-		OpType:          OpType(args.Op),
-		Key:             args.Key,
-		Value:           args.Value,
-		StartTimestamp:  time.Now().UnixMilli(),
+		ClientId:       args.ClientId,
+		RequestId:      args.RequestId,
+		OpType:         OpType(args.Op),
+		Key:            args.Key,
+		Value:          args.Value,
+		StartTimestamp: time.Now().UnixMilli(),
 	}
-	reply.LeaderId = kv.rf.LeaderId()
 	term := 0
 	isLeader := false
+	reply.Err = ErrWrongLeader
 	if term, isLeader = kv.rf.GetState(); !isLeader {
-		reply.Err = ErrWrongLeader
 		return
 	}
+
 	start := time.Now()
 	defer func() {
-		DPrintf("server PutAppend cost: %v, node: %d, leaderId: %d", time.Now().Sub(start).Milliseconds(), kv.me, kv.rf.LeaderId())
+		DPrintf("server PutAppend cost: %v, requestId: %d, node: %d, leaderId: %d", time.Now().Sub(start).Milliseconds(), op.RequestId, kv.me, kv.rf.LeaderId())
 	}()
-	opContext := NewOpContext(op.UniqueRequestId, op, term)
-	kv.opContextMap[op.UniqueRequestId] = opContext
+	kv.mu.Lock()
+	//可能存在前一次请求超时，但是这个请求实际上执行成功了，那么就直接return掉
+	if lastRequestId, ok := kv.lastRequestIdMap[op.ClientId]; ok && lastRequestId >= op.RequestId {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	opContext := NewOpContext(op, term)
+	kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)] = opContext
+	kv.mu.Unlock()
 	_, _, ok := kv.rf.Start(*op)
 	defer func() {
 		//DPrintf("server PutAppend, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
-		delete(kv.opContextMap, op.UniqueRequestId)
+		kv.mu.Lock()
+		delete(kv.opContextMap, UniqueRequestId(op.ClientId, op.RequestId))
+		kv.mu.Unlock()
 	}()
 	if !ok {
-		reply.Err = ErrWrongLeader
 		return
 	}
 	//阻塞等待
 	select {
 	case <-opContext.WaitCh:
 		reply.Err = OK
-	case <-time.After(time.Millisecond * 500):
+	case <-time.After(time.Millisecond * 1000):
 		reply.Err = ErrTimeout
 	}
-}
-
-func (kv *KVServer) write2RaftLoop() {
-
 }
 
 //串行写状态机
@@ -162,28 +175,31 @@ func (kv *KVServer) applyStateMachineLoop() {
 		select {
 		case applyMsg := <-kv.applyCh:
 			if applyMsg.CommandValid {
-
-				op := applyMsg.Command.(Op)
-				//保证幂等性
-				if _, ok := kv.idempotencyMap[op.UniqueRequestId]; ok {
-					break
-				}
-				DPrintf("op: %v, cost: %v", mr.Any2String(op), time.Now().UnixMilli()-op.StartTimestamp)
-				kv.idempotencyMap[op.UniqueRequestId] = time.Now().UnixMilli()
-				kv.mu.Lock()
-				switch op.OpType {
-				case OpTypePut:
-					kv.kvStore[op.Key] = op.Value
-				case OpTypeAppend:
-					kv.kvStore[op.Key] += op.Value
-				case OpTypeGet:
-				}
-				val := kv.kvStore[op.Key]
-				kv.mu.Unlock()
-				//使得写入的client能够响应
-				if c, ok := kv.opContextMap[op.UniqueRequestId]; ok {
-					c.WaitCh <- val
-				}
+				func() {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+					op := applyMsg.Command.(Op)
+					//保证幂等性
+					if op.RequestId <= kv.lastRequestIdMap[op.ClientId] {
+						return
+					}
+					switch op.OpType {
+					case OpTypePut:
+						kv.kvStore[op.Key] = op.Value
+						kv.lastRequestIdMap[op.ClientId] = op.RequestId
+					case OpTypeAppend:
+						kv.kvStore[op.Key] += op.Value
+						kv.lastRequestIdMap[op.ClientId] = op.RequestId
+					case OpTypeGet:
+						//Get请求不需要更新lastRequestId
+					}
+					DPrintf("op: %v, value: %v, node: %v cost: %v,requestId: %v, stateMachine: %v", mr.Any2String(op), kv.kvStore[op.Key], kv.me, time.Now().UnixMilli()-op.StartTimestamp, op.RequestId, mr.Any2String(kv.kvStore))
+					val := kv.kvStore[op.Key]
+					//使得写入的client能够响应
+					if c, ok := kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)]; ok {
+						c.WaitCh <- val
+					}
+				}()
 			}
 		}
 	}
@@ -233,13 +249,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 10)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.kvStore = make(map[string]string)
 	kv.opContextMap = make(map[uint64]*OpContext)
-	kv.idempotencyMap = make(map[uint64]int64)
-	kv.proposeC = make(chan *Op, 10)
+	kv.lastRequestIdMap = make(map[int]uint64)
 
 	go kv.applyStateMachineLoop()
 
