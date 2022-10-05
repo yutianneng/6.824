@@ -75,7 +75,7 @@ func (cfg *config) cleanup() {
 		}
 	}
 	cfg.net.Cleanup()
-	cfg.checkTimeout()
+	//cfg.checkTimeout()
 }
 
 // Maximum log size across all servers
@@ -412,7 +412,7 @@ func (cfg *config) op() {
 // print the Passed message,
 // and some performance numbers.
 func (cfg *config) end() {
-	cfg.checkTimeout()
+	//cfg.checkTimeout()
 	if cfg.t.Failed() == false {
 		t := time.Since(cfg.t0).Seconds()  // real time
 		npeers := cfg.n                    // number of Raft peers

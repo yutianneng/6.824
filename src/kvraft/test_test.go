@@ -671,6 +671,7 @@ func TestSnapshotSize3B(t *testing.T) {
 		check(cfg, t, ck, "x", "0")
 		Put(cfg, ck, "x", "1", nil, -1)
 		check(cfg, t, ck, "x", "1")
+		//fmt.Printf("TestSnapshotSize3B put times: %v\n", i)
 	}
 
 	// check that servers have thrown away most of their log entries

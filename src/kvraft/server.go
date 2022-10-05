@@ -5,6 +5,7 @@ import (
 	"6.824/labrpc"
 	"6.824/mr"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -64,7 +65,9 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate      int // snapshot if log grows this big
+	persister         *raft.Persister
+	lastIncludedIndex int
 
 	// Your definitions here.
 	kvStore          map[string]string     //k-v对
@@ -183,13 +186,22 @@ func (kv *KVServer) applyStateMachineLoop() {
 					if op.RequestId <= kv.lastRequestIdMap[op.ClientId] {
 						return
 					}
+					//过滤掉snapshot前的日志
+					if applyMsg.CommandIndex <= kv.lastIncludedIndex && op.OpType != OpTypeGet {
+						if c, ok := kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)]; ok {
+							c.WaitCh <- "0"
+						}
+						return
+					}
 					switch op.OpType {
 					case OpTypePut:
 						kv.kvStore[op.Key] = op.Value
 						kv.lastRequestIdMap[op.ClientId] = op.RequestId
+						kv.maybeSnapshot(applyMsg.CommandIndex)
 					case OpTypeAppend:
 						kv.kvStore[op.Key] += op.Value
 						kv.lastRequestIdMap[op.ClientId] = op.RequestId
+						kv.maybeSnapshot(applyMsg.CommandIndex)
 					case OpTypeGet:
 						//Get请求不需要更新lastRequestId
 					}
@@ -200,9 +212,61 @@ func (kv *KVServer) applyStateMachineLoop() {
 						c.WaitCh <- val
 					}
 				}()
+			} else if applyMsg.SnapshotValid {
+				func() {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+					if kv.decodeSnapshot(applyMsg.Snapshot) {
+						kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot)
+					}
+				}()
 			}
 		}
+		DPrintf("snapshot size: %v, stateMachine: %v", kv.persister.SnapshotSize(), mr.Any2String(kv.kvStore))
 	}
+}
+
+func (kv *KVServer) maybeSnapshot(index int) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.persister.RaftStateSize() > kv.maxraftstate {
+		DPrintf("maybeSnapshot starting, index: %v", index)
+		kv.rf.Snapshot(index, kv.encodeSnapshot(index))
+	}
+}
+
+//上层加锁
+func (kv *KVServer) encodeSnapshot(lastIncludedIndex int) []byte {
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvStore)
+	e.Encode(lastIncludedIndex)
+	e.Encode(kv.lastRequestIdMap) //持久化每个client的最大已执行过的写请求
+	return w.Bytes()
+}
+
+//上层加锁
+func (kv *KVServer) decodeSnapshot(snapshot []byte) bool {
+
+	if len(snapshot) == 0 {
+		return true
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if err := d.Decode(&kv.kvStore); err != nil {
+		return false
+	}
+	if err := d.Decode(&kv.lastIncludedIndex); err != nil {
+		return false
+	}
+	//持久化每个client的最大已执行过的写请求
+	if err := d.Decode(&kv.lastRequestIdMap); err != nil {
+		return false
+	}
+	return true
 }
 
 //
@@ -248,13 +312,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	kv.applyCh = make(chan raft.ApplyMsg, 10)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	kv.kvStore = make(map[string]string)
 	kv.opContextMap = make(map[uint64]*OpContext)
 	kv.lastRequestIdMap = make(map[int]uint64)
+	kv.applyCh = make(chan raft.ApplyMsg, 10)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.decodeSnapshot(persister.ReadSnapshot())
 
 	go kv.applyStateMachineLoop()
 
