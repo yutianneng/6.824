@@ -1,6 +1,7 @@
 package shardctrler
 
 import (
+	"6.824/mr"
 	"fmt"
 	"sync"
 	"testing"
@@ -54,6 +55,7 @@ func check(t *testing.T, groups []int, ck *Clerk) {
 }
 
 func check_same_config(t *testing.T, c1 Config, c2 Config) {
+	DPrintf("history query, c1: %v, c2: %v", mr.Any2String(c1), mr.Any2String(c2))
 	if c1.Num != c2.Num {
 		t.Fatalf("Num wrong")
 	}
@@ -122,11 +124,12 @@ func TestBasic(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 
 	fmt.Printf("Test: Historical queries ...\n")
-
+	DPrintf("cfa: %v", mr.Any2String(cfa))
 	for s := 0; s < nservers; s++ {
 		cfg.ShutdownServer(s)
 		for i := 0; i < len(cfa); i++ {
 			c := ck.Query(cfa[i].Num)
+			DPrintf("cfa[%d]: %v, c: %v", i, mr.Any2String(cfa[i]), mr.Any2String(c))
 			check_same_config(t, c, cfa[i])
 		}
 		cfg.StartServer(s)

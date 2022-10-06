@@ -4,14 +4,24 @@ package shardctrler
 // Shardctrler clerk.
 //
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"sync"
+	"sync/atomic"
+)
 import "time"
 import "crypto/rand"
 import "math/big"
 
+var clientGerarator int32
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// Your data here.
+
+	mu              sync.Mutex
+	lastRpcServerId int
+	clientId        int
+	nextRequestId   uint64 //clientId<<12+nextRequestId
 }
 
 func nrand() int64 {
@@ -24,16 +34,22 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// Your code here.
+	ck.mu = sync.Mutex{}
+	ck.lastRpcServerId = 0
+	ck.clientId = int(atomic.AddInt32(&clientGerarator, 1))
+	ck.nextRequestId = 0
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
-	// Your code here.
-	args.Num = num
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &QueryArgs{
+		Num:       num,
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddUint64(&ck.nextRequestId, 1),
+	}
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
@@ -46,9 +62,13 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &JoinArgs{
+		Servers:   servers,
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddUint64(&ck.nextRequestId, 1),
+	}
 
 	for {
 		// try each known server.
@@ -64,12 +84,15 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
-	// Your code here.
-	args.GIDs = gids
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &LeaveArgs{
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddUint64(&ck.nextRequestId, 1),
+		GIDs:      gids,
+	}
 
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply LeaveReply
 			ok := srv.Call("ShardCtrler.Leave", args, &reply)
@@ -82,13 +105,15 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
-	// Your code here.
-	args.Shard = shard
-	args.GID = gid
-
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &MoveArgs{
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddUint64(&ck.nextRequestId, 1),
+		Shard:     shard,
+		GID:       gid,
+	}
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply MoveReply
 			ok := srv.Call("ShardCtrler.Move", args, &reply)

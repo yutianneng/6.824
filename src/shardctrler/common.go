@@ -28,14 +28,36 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+type OpType string
+
 const (
-	OK = "OK"
+	OpTypeJoin  = "Join"
+	OpTypeLeave = "Leave"
+	OpTypeMove  = "Move"
+	OpTypeQuery = "Query"
+)
+
+type ConfigEdit struct {
+	NewGroups map[int][]string //Join
+	LeaveGids []int            //Leave
+
+	//Move
+	ShardId int
+	DestGid int
+}
+
+const (
+	OK              = "OK"
+	ErrParamInvalid = "ErrParamInvalid"
+	ErrTimeout      = "ErrTimeout"
 )
 
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	ClientId  int
+	RequestId uint64
+	Servers   map[int][]string // new GID -> servers mappings
 }
 
 type JoinReply struct {
@@ -44,7 +66,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	ClientId  int
+	RequestId uint64
+	GIDs      []int
 }
 
 type LeaveReply struct {
@@ -53,8 +77,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	ClientId  int
+	RequestId uint64
+	Shard     int
+	GID       int
 }
 
 type MoveReply struct {
@@ -63,11 +89,17 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	ClientId  int
+	RequestId uint64
+	Num       int // desired config number
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+func UniqueRequestId(clientId int, requestId uint64) uint64 {
+	return uint64(clientId<<32) + requestId&0xffffffff
 }
