@@ -69,85 +69,34 @@ func (sc *ShardCtrler) Config(number int) Config {
 	return sc.configs[number]
 }
 
+//gids是leader当前config的gids，因为go map遍历是随机的，需要确保主从一致
 func (sc *ShardCtrler) rebalanceJoin(number int, newGroups map[int][]string) *Config {
 
-	//过滤掉没有server的raft group
-	newGroups1 := map[int][]string{}
-	for gid, servers := range newGroups {
-		if len(servers) > 0 {
-			newGroups1[gid] = servers
-		}
-	}
-	newGroups = newGroups1
-	//DPrintf("rebalanceJoin newGroups: %v", mr.Any2String(newGroups))
 	conf := sc.configs[len(sc.configs)-1]
 	//合并当前版本的raft group和新加入的group
 	groups := map[int][]string{}
+	gids := make([]int, 0)
 	for gid, servers := range conf.Groups {
 		dst := make([]string, len(servers))
 		copy(dst, servers)
 		groups[gid] = dst
+		gids = append(gids, gid)
 	}
-	var shards [NShards]int
-	copy(shards[:], conf.Shards[:])
-
-	//DPrintf("rebalanceJoin groups: %v", mr.Any2String(groups))
-	groupNum := len(groups) + len(newGroups)
-	aver := len(conf.Shards) / groupNum
-	//shard>group，平均每个group分不到一个shard，不移动最好
-	if aver == 0 {
-		for gid, servers := range newGroups {
-			groups[gid] = servers
-		}
-		return &Config{
-			Num:    number,
-			Shards: shards,
-			Groups: groups,
-		}
-	}
-
-	group2Shards := map[int][]int{}
-	//获取每个group超出aver的分片，将其分配给new group
-	remainder := make([]int, 0)
-	for i := 0; i < len(conf.Shards); i++ {
-		if _, ok := group2Shards[conf.Shards[i]]; !ok && conf.Shards[i] != 0 {
-			group2Shards[conf.Shards[i]] = make([]int, 0)
-		}
-		if conf.Shards[i] == 0 {
-			//未分配的分片放入remainder
-			remainder = append(remainder, i)
-		} else if len(group2Shards[conf.Shards[i]]) >= aver {
-			//已分配但超出平均数的分片放入remainder
-			remainder = append(remainder, i)
-		} else {
-			//已分配且未超出group平均负载数量的分片仍然由这个group负责，尽量不迁移
-			group2Shards[conf.Shards[i]] = append(group2Shards[conf.Shards[i]], i)
-		}
-	}
-	//DPrintf("rebalanceJoin remainder: %v", mr.Any2String(remainder))
-
-	newGids := make([]int, 0)
-	for gid, _ := range newGroups {
-		newGids = append(newGids, gid)
-	}
-	//DPrintf("rebalanceJoin newGids: %v", mr.Any2String(newGids))
-
-	j := 0
-	for i := 0; i < len(remainder); i++ {
-		shards[remainder[i]] = newGids[j]
-		j++
-		j %= len(newGids)
-	}
-	//DPrintf("rebalanceJoin shards: %v", mr.Any2String(shards))
-
-	//合并新group
 	for gid, servers := range newGroups {
 		dst := make([]string, len(servers))
 		copy(dst, servers)
 		groups[gid] = dst
+		gids = append(gids, gid)
 	}
-	//DPrintf("rebalanceJoin groups: %v", mr.Any2String(groups))
+	sort.Slice(gids, func(i, j int) bool {
+		return gids[i] < gids[j]
+	})
+	var shards [NShards]int
+	copy(shards[:], conf.Shards[:])
 
+	for i := 0; i < len(shards); i++ {
+		shards[i] = gids[i%len(gids)]
+	}
 	return &Config{
 		Num:    number,
 		Shards: shards,
@@ -155,15 +104,12 @@ func (sc *ShardCtrler) rebalanceJoin(number int, newGroups map[int][]string) *Co
 	}
 }
 
-func (sc *ShardCtrler) rebalanceLeave(number int, gids []int) *Config {
+func (sc *ShardCtrler) rebalanceLeave(number int, leaveGids []int) *Config {
 	//获取这些分片，以及剩余每个group的分片数量
 	conf := sc.configs[len(sc.configs)-1]
-	DPrintf("server rebalanceLeave, number: %v, leaveGids: %v, config: %v", number, mr.Any2String(gids), mr.Any2String(conf))
-	//copy分片
 	var shards [NShards]int
 	copy(shards[:], conf.Shards[:])
 
-	//copy group
 	groups := map[int][]string{}
 	for gid, servers := range conf.Groups {
 		dst := make([]string, len(servers))
@@ -171,58 +117,29 @@ func (sc *ShardCtrler) rebalanceLeave(number int, gids []int) *Config {
 		groups[gid] = dst
 	}
 	//移除掉删除的group
-	for _, gid := range gids {
+	for _, gid := range leaveGids {
 		delete(groups, gid)
 	}
-
-	if len(groups) == 0 {
-		for i := 0; i < len(shards); i++ {
-			shards[i] = 0
-		}
+	gids := make([]int, 0)
+	for gid, _ := range groups {
+		gids = append(gids, gid)
+	}
+	sort.Slice(gids, func(i, j int) bool {
+		return gids[i] < gids[j]
+	})
+	if len(gids) == 0 {
+		shards = [NShards]int{}
 	} else {
-		//收集各个group的分片以及空闲分片
-		group2Shards := map[int][]int{}
-		//获取每个group超出aver的分片，将其分配给new group
-		remainder := make([]int, 0)
-		DPrintf("copy shard: %v", mr.Any2String(shards))
-
 		for i := 0; i < len(shards); i++ {
-			//仍存在的组依旧负责它的分片
-			if _, ok := groups[conf.Shards[i]]; ok {
-				if _, ok1 := group2Shards[conf.Shards[i]]; !ok1 {
-					group2Shards[conf.Shards[i]] = make([]int, 0)
-				}
-				group2Shards[conf.Shards[i]] = append(group2Shards[conf.Shards[i]], i)
-			} else {
-				//不存在的组的分片是空闲分片，放入remainder
-				remainder = append(remainder, i)
-			}
-		}
-		//收集gid并排序
-		newGids := make([]int, 0)
-		for gid, _ := range groups {
-			newGids = append(newGids, gid)
-		}
-		//对当前存活的group进行排序，按照负责的分片数量从小到达排序
-		sort.Slice(newGids, func(i, j int) bool {
-			return len(group2Shards[newGids[i]]) < len(group2Shards[newGids[j]])
-		})
-
-		DPrintf("server rebalanceLeave, remainder: %v, newGids: %v, group2Shards: %v, groups: %v", mr.Any2String(remainder), mr.Any2String(newGids), mr.Any2String(group2Shards), mr.Any2String(groups))
-		//将idleShards分配给剩余的group中
-		j := 0
-		for _, shardId := range remainder {
-			shards[shardId] = newGids[j]
-			j++
-			j %= len(newGids)
+			shards[i] = gids[i%len(gids)]
 		}
 	}
-
 	return &Config{
 		Num:    number,
 		Shards: shards,
 		Groups: groups,
 	}
+
 }
 
 func (sc *ShardCtrler) rebalanceMove(number, shardId, togid int) *Config {
