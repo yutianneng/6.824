@@ -8,11 +8,18 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"6.824/mr"
+	"sync"
+	"sync/atomic"
+)
 import "crypto/rand"
 import "math/big"
 import "6.824/shardctrler"
 import "time"
+
+var clientGerarator int32
 
 //
 // which shard is a key in?
@@ -36,10 +43,15 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardctrler.Clerk
-	config   shardctrler.Config
-	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	sm              *shardctrler.Clerk
+	config          shardctrler.Config
+	make_end        func(string) *labrpc.ClientEnd
+	mu              sync.Mutex
+	groupClientsMap map[int][]*labrpc.ClientEnd //其他group的客户端代理
+
+	lastRpcServerId int
+	clientId        int
+	nextRequestId   uint64 //clientId<<12+nextRequestId
 }
 
 //
@@ -54,8 +66,13 @@ type Clerk struct {
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
+	//给new group创建ClientEnd来通信
 	ck.make_end = make_end
+	ck.groupClientsMap = make(map[int][]*labrpc.ClientEnd)
 	// You'll have to add code here.
+	ck.lastRpcServerId = 0
+	ck.clientId = int(atomic.AddInt32(&clientGerarator, 1))
+	ck.nextRequestId = 0
 	return ck
 }
 
@@ -66,33 +83,42 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
-
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	for ck.config.Num == 0 {
+		ck.UpdateConfiguration()
+	}
+	shard := key2shard(key)
+	args := GetArgs{
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddUint64(&ck.nextRequestId, 1),
+		Key:       key,
+		ShardId:   shard,
+	}
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
+
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+				DPrintf("ShardKV Clerk Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					DPrintf("ShardKV Clerk Get,success args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					ck.UpdateConfiguration()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
 	}
 
-	return ""
 }
 
 //
@@ -100,32 +126,42 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	for ck.config.Num == 0 {
+		ck.UpdateConfiguration()
+	}
+	shard := key2shard(key)
 
-
+	args := PutAppendArgs{
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddUint64(&ck.nextRequestId, 1),
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ShardId:   shard,
+	}
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		//DPrintf("ShardKV Client.PutAppend, gid: %v, shardId: %d", gid, shard)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
+				//DPrintf("ShardKV Client.PutAppend, gid: %v, shardId: %d, args: %v", gid, shard, mr.Any2String(args))
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					DPrintf("shardKV Clerk.PutAppend args: %v reply: %v", mr.Any2String(args), mr.Any2String(reply))
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					ck.UpdateConfiguration()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
 	}
 }
 
@@ -134,4 +170,15 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+//更新路由信息,上层必须加锁
+func (ck *Clerk) UpdateConfiguration() {
+
+	conf := ck.sm.Query(-1)
+	if ck.config.Num != 0 && conf.Num <= ck.config.Num {
+		return
+	}
+	ck.config = conf
+	DPrintf("shardkv client update config: %v", mr.Any2String(conf))
 }

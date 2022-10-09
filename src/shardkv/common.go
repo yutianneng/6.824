@@ -1,5 +1,10 @@
 package shardkv
 
+import (
+	"6.824/shardctrler"
+	"encoding/json"
+)
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -8,25 +13,46 @@ package shardkv
 //
 // You will have to modify these definitions.
 //
+type Err string
 
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrPutAppend   = "ErrPutAppend"
+	ErrTimeout     = "ErrTimeout"
+	ErrDuplicated  = "ErrDuplicated"
 )
 
-type Err string
+type status int
+
+const (
+	Normal        status = 1 //正常可读写
+	Migrating     status = 2 //迁移中，暂时不可读写
+	Migrated      status = 3 //已迁移走了
+	Waiting       status = 4 //等待迁移
+	NoResponsible status = 5 //不是自己负责的shard
+)
+
+type ShardConfig struct {
+	ShardStatus status
+	KvStore     map[string]string
+}
+
+func (s *ShardConfig) String() string {
+	bytes, _ := json.Marshal(s)
+	return string(bytes)
+}
 
 // Put or Append
 type PutAppendArgs struct {
-	// You'll have to add definitions here.
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	ClientId  int
+	RequestId uint64
+	Key       string
+	Value     string
+	ShardId   int
+	Op        string // "Put" or "Append"
 }
 
 type PutAppendReply struct {
@@ -34,11 +60,43 @@ type PutAppendReply struct {
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+	ClientId  int
+	RequestId uint64
+	Key       string
+	ShardId   int
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type PullShardArgs struct {
+	ClientId  int
+	RequestId uint64
+	ShardId   int
+}
+
+type PullShardReply struct {
+	Err  Err
+	Data []byte
+}
+
+func UniqueRequestId(clientId int, requestId uint64) uint64 {
+	return uint64(clientId<<32) + requestId&0xffffffff
+}
+
+func Decode2Map(data []byte) map[string]string {
+	m := map[string]string{}
+	json.Unmarshal(data, &m)
+	return m
+}
+func Decode2Config(data []byte) *shardctrler.Config {
+	conf := &shardctrler.Config{}
+	json.Unmarshal(data, conf)
+	return conf
+}
+func Encode2Byte(m interface{}) []byte {
+	bytes, _ := json.Marshal(m)
+	return bytes
 }

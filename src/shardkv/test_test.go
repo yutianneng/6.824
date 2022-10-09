@@ -25,10 +25,10 @@ func check(t *testing.T, ck *Clerk, key string, value string) {
 //
 func TestStaticShards(t *testing.T) {
 	fmt.Printf("Test: static shards ...\n")
-
+	//创建controller和group ShardKV
 	cfg := make_config(t, 3, false, -1)
 	defer cfg.cleanup()
-
+	//创建client
 	ck := cfg.makeClient()
 
 	cfg.join(0)
@@ -40,6 +40,7 @@ func TestStaticShards(t *testing.T) {
 	for i := 0; i < n; i++ {
 		ka[i] = strconv.Itoa(i) // ensure multiple shards
 		va[i] = randstring(20)
+		DPrintf("TestStaticShards test ck.Put, k[%v] v[%v], n[%d]", ka[i], va[i], n)
 		ck.Put(ka[i], va[i])
 	}
 	for i := 0; i < n; i++ {
