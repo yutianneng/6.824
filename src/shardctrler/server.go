@@ -11,7 +11,7 @@ import "6.824/labrpc"
 import "sync"
 import "6.824/labgob"
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -212,7 +212,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		reply.Err = ErrTimeout
 		reply.WrongLeader = false
 	}
-	DPrintf("server join, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+	DPrintf("controller server join, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 
 }
 
@@ -242,7 +242,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	sc.opContextMap[opContext.UniqueRequestId] = opContext
 	sc.mu.Unlock()
 	defer func() {
-		DPrintf("server Leave, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		DPrintf("controller server Leave, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 		sc.mu.Lock()
 		delete(sc.opContextMap, opContext.UniqueRequestId)
 		sc.mu.Unlock()
@@ -285,7 +285,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	sc.opContextMap[opContext.UniqueRequestId] = opContext
 	sc.mu.Unlock()
 	defer func() {
-		DPrintf("server Move, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		DPrintf("controller server Move, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 		sc.mu.Lock()
 		delete(sc.opContextMap, opContext.UniqueRequestId)
 		sc.mu.Unlock()
@@ -326,7 +326,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	sc.mu.Unlock()
 
 	defer func() {
-		DPrintf("server Query, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		DPrintf("controller server Query, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 		sc.mu.Lock()
 		delete(sc.opContextMap, opContext.UniqueRequestId)
 		sc.mu.Unlock()
@@ -335,7 +335,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		reply.WrongLeader = true
 		return
 	}
-	DPrintf("entering server Query, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+	//DPrintf("entering server Query, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 
 	//阻塞等待
 	select {
@@ -375,7 +375,7 @@ func (sc *ShardCtrler) applyStateMachineLoop() {
 						conf := sc.rebalanceJoin(number, op.Value.NewGroups)
 						sc.configs = append(sc.configs, *conf)
 						sc.lastRequestIdMap[op.ClientId] = op.RequestId
-						DPrintf("applyLoop join, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
+						DPrintf("controller applyLoop join, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
 					case OpTypeLeave:
 						number := sc.nextNumber
 						sc.nextNumber++
@@ -383,7 +383,7 @@ func (sc *ShardCtrler) applyStateMachineLoop() {
 						conf := sc.rebalanceLeave(number, op.Value.LeaveGids)
 						sc.configs = append(sc.configs, *conf)
 						sc.lastRequestIdMap[op.ClientId] = op.RequestId
-						DPrintf("applyLoop leave, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
+						DPrintf("controller applyLoop leave, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
 
 					case OpTypeMove:
 						number := sc.nextNumber
@@ -392,12 +392,12 @@ func (sc *ShardCtrler) applyStateMachineLoop() {
 						conf := sc.rebalanceMove(number, op.Value.ShardId, op.Value.DestGid)
 						sc.configs = append(sc.configs, *conf)
 						sc.lastRequestIdMap[op.ClientId] = op.RequestId
-						DPrintf("applyLoop move, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
+						DPrintf("controller applyLoop move, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
 					case OpTypeQuery:
 						//Get请求不需要更新lastRequestId
 						val = sc.Config(op.Number)
 					}
-					DPrintf("op: %v, config: %v, node: %v cost: %v,requestId: %v, stateMachine: %v", mr.Any2String(op), mr.Any2String(val), sc.me, time.Now().UnixMilli()-op.StartTimestamp, op.RequestId, mr.Any2String(sc.configs))
+					//DPrintf("op: %v, config: %v, node: %v cost: %v,requestId: %v, stateMachine: %v", mr.Any2String(op), mr.Any2String(val), sc.me, time.Now().UnixMilli()-op.StartTimestamp, op.RequestId, mr.Any2String(sc.configs))
 					//使得写入的client能够响应
 					if c, ok := sc.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)]; ok {
 						c.WaitCh <- val

@@ -13,7 +13,7 @@ import "6.824/raft"
 import "sync"
 import "6.824/labgob"
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -70,8 +70,7 @@ type ShardKV struct {
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
-	maxraftstate int                         // snapshot if log grows this big
-	shardKVs     map[int][]*labrpc.ClientEnd //与其他分片通信的client
+	maxraftstate int // snapshot if log grows this big
 
 	dead int32 // set by Kill()
 
@@ -80,10 +79,12 @@ type ShardKV struct {
 	persister         *raft.Persister
 	lastIncludedIndex int
 
-	lastConfig    shardctrler.Config
-	currentConfig shardctrler.Config
+	lastConfig             shardctrler.Config
+	currentConfig          shardctrler.Config
+	pendingMigrationShards []int
 
 	shardConfigMap map[int]*ShardConfig
+	kvStatus       status
 
 	opContextMap     map[uint64]*OpContext //用于每个请求的上下文
 	lastRequestIdMap map[int]uint64        //clientId-->lastRequestId，维持幂等性，需要客户端能够保证串行
@@ -93,7 +94,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.Lock()
 	term, err := kv.check(OpTypeGet, args.ShardId, args.ClientId, args.RequestId)
-	DPrintf("ShardKV.Get, config: %v, args: %v, reply: %v", mr.Any2String(kv.currentConfig), mr.Any2String(args), mr.Any2String(reply))
+	DPrintf("ShardKV server.Get, err: %v gid: %v node: %v shardConfigMap: %v", err, kv.gid, kv.me, mr.Any2String(kv.shardConfigMap))
 
 	if err != OK {
 		reply.Err = err
@@ -125,8 +126,12 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	//阻塞等待
 	select {
 	case c := <-opContext.WaitCh:
-		reply.Err = OK
-		reply.Value = c
+		if c == ErrWrongGroup {
+			reply.Err = ErrWrongGroup
+		} else {
+			reply.Err = OK
+			reply.Value = c
+		}
 	case <-time.After(time.Millisecond * 1000):
 		reply.Err = ErrTimeout
 	}
@@ -155,9 +160,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		StartTimestamp: time.Now().UnixMilli(),
 	}
 
-	start := time.Now()
+	//start := time.Now()
 	defer func() {
-		DPrintf("shardKV server PutAppend cost: %v, requestId: %d, node: %d, leaderId: %d", time.Now().Sub(start).Milliseconds(), op.RequestId, kv.me, kv.rf.LeaderId())
+		//DPrintf("shardKV server PutAppend cost: %v, requestId: %d, node: %d, leaderId: %d", time.Now().Sub(start).Milliseconds(), op.RequestId, kv.me, kv.rf.LeaderId())
 	}()
 	opContext := NewOpContext(op, term)
 	kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)] = opContext
@@ -176,36 +181,17 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	//阻塞等待
 	select {
-	case <-opContext.WaitCh:
-		reply.Err = OK
+	case res := <-opContext.WaitCh:
+		reply.Err = Err(res)
 	case <-time.After(time.Millisecond * 1000):
 		reply.Err = ErrTimeout
 	}
 }
 func (kv *ShardKV) check(opType OpType, shardId, clientId int, requestId uint64) (int, Err) {
 
-	for kv.currentConfig.Num == 0 {
-		conf := kv.pullConfiguration()
-		if conf.Num > 0 {
-			kv.lastConfig = kv.currentConfig
-			kv.currentConfig = *conf
-
-			for sid, gid := range conf.Shards {
-				if gid == kv.gid {
-					kv.shardConfigMap[sid] = &ShardConfig{
-						ShardStatus: Normal,
-						KvStore:     map[string]string{},
-					}
-				} else {
-					kv.shardConfigMap[sid] = &ShardConfig{
-						ShardStatus: NoResponsible,
-						KvStore:     map[string]string{},
-					}
-				}
-			}
-		}
+	if kv.currentConfig.Num == 0 {
+		return 0, ErrShardNotArrived
 	}
-
 	if shard, ok := kv.shardConfigMap[shardId]; !ok || shard.ShardStatus != Normal {
 		return 0, ErrWrongGroup
 	}
@@ -234,61 +220,65 @@ func (kv *ShardKV) applyStateMachineLoop() {
 					kv.mu.Lock()
 					defer kv.mu.Unlock()
 					op := applyMsg.Command.(Op)
-					DPrintf("shardKV applyStateMachineLoop, node[%d] op: %v", kv.me, mr.Any2String(op))
+					//DPrintf("shardKV applyStateMachineLoop, gid[%d] node[%d] op: %v", kv.gid, kv.me, mr.Any2String(op))
 					//保证幂等性, 过滤掉snapshot前的日志
-					if op.RequestId <= kv.lastRequestIdMap[op.ClientId] || (applyMsg.CommandIndex <= kv.lastIncludedIndex && op.OpType != OpTypeGet) {
+					if op.RequestId <= kv.lastRequestIdMap[op.ClientId] || applyMsg.CommandIndex <= kv.lastIncludedIndex {
 						if c, ok := kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)]; ok {
-							c.WaitCh <- ""
+							c.WaitCh <- ErrDuplicated
 						}
 						return
 					}
-					if shard, ok := kv.shardConfigMap[op.ShardId]; !ok || shard.ShardStatus != Normal {
-						DPrintf("shardKV server.applyStateMachineLoop, not apply op: %v to machine, shard: %v", mr.Any2String(op), mr.Any2String(shard))
-						if c, ok1 := kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)]; ok1 {
-							c.WaitCh <- ""
+					//不能正常接收客户端读写请求
+					if op.OpType == OpTypeGet || op.OpType == OpTypeAppend || op.OpType == OpTypePut {
+						if shard, ok := kv.shardConfigMap[op.ShardId]; !ok || shard.ShardStatus != Normal {
+							//DPrintf("shardKV server.applyStateMachineLoop, not apply op: %v to machine, shard: %v", mr.Any2String(op), mr.Any2String(shard))
+							if c, ok1 := kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)]; ok1 {
+								c.WaitCh <- ErrWrongGroup
+							}
+							return
 						}
-						return
 					}
+					val := ""
 					switch op.OpType {
 					case OpTypePut:
 						kv.shardConfigMap[op.ShardId].KvStore[op.Key] = op.Value
 						kv.lastRequestIdMap[op.ClientId] = op.RequestId
+						val = OK
 						//kv.maybeSnapshot(applyMsg.CommandIndex)
 					case OpTypeAppend:
 						kv.shardConfigMap[op.ShardId].KvStore[op.Key] += op.Value
 						kv.lastRequestIdMap[op.ClientId] = op.RequestId
+						val = OK
 						//kv.maybeSnapshot(applyMsg.CommandIndex)
 					case OpTypeGet:
-					//Get请求不需要更新lastRequestId
+						//Get请求不需要更新lastRequestId
+						val = kv.shardConfigMap[op.ShardId].KvStore[op.Key]
 					case OpTypeUpdateConfig:
+						//已经有配置在更新
 						conf := Decode2Config([]byte(op.Value))
-						if conf != nil && conf.Num > kv.currentConfig.Num {
-							kv.lastConfig = kv.currentConfig
-							kv.currentConfig = *conf
-						}
-						go kv.startMigration()
+						kv.updateShardConfig(conf)
 
 					case OpTypeMigration:
-						//不重复
 						r := bytes.NewBuffer([]byte(op.Value))
 						d := labgob.NewDecoder(r)
 						num, shardId := 0, -1
 						d.Decode(&num)
 						d.Decode(&shardId)
-						if num < kv.currentConfig.Num {
+						if _, ok := kv.shardConfigMap[op.ShardId]; !ok {
+							kv.shardConfigMap[op.ShardId] = &ShardConfig{}
+						}
+						if num < kv.shardConfigMap[op.ShardId].Num {
 							return
 						}
 						kvStore := map[string]string{}
 						d.Decode(&kvStore)
+
 						kv.shardConfigMap[op.ShardId].KvStore = kvStore
 						kv.shardConfigMap[op.ShardId].ShardStatus = Normal //迁移成功
-						go func() {
-
-						}()
+						DPrintf("shardKV migrate shard, gid: %v, node: %v, num: %v shardConfigMap: %v", kv.gid, kv.me, num, mr.Any2String(kv.shardConfigMap))
 
 					}
-					val := kv.shardConfigMap[op.ShardId].KvStore[op.Key]
-					DPrintf("applyLoop, op: %v write to shard: %v", mr.Any2String(op), mr.Any2String(kv.shardConfigMap[op.ShardId]))
+					//DPrintf("applyLoop, op: %v write to shardId[%d] gid[%d] node[%d]: %v", mr.Any2String(op), op.ShardId, kv.gid, kv.me, mr.Any2String(kv.shardConfigMap[op.ShardId]))
 					//使得写入的client能够响应
 					if c, ok := kv.opContextMap[UniqueRequestId(op.ClientId, op.RequestId)]; ok {
 						c.WaitCh <- val
@@ -304,10 +294,52 @@ func (kv *ShardKV) applyStateMachineLoop() {
 				}()
 			}
 		}
-		//DPrintf("snapshot size: %v, stateMachine: %v", kv.persister.SnapshotSize(), mr.Any2String(kv.kvStore))
 	}
 }
+func (kv *ShardKV) updateShardConfig(conf *shardctrler.Config) {
 
+	if conf != nil && conf.Num <= kv.currentConfig.Num {
+		return
+	}
+	kv.lastConfig = kv.currentConfig
+	kv.currentConfig = *conf
+	//更新分片
+	//首次更新，不需要迁移
+	if kv.lastConfig.Num == 0 {
+		for shardId, gid := range conf.Shards {
+			kv.shardConfigMap[shardId] = &ShardConfig{}
+			kv.shardConfigMap[shardId].Num = conf.Num
+			kv.shardConfigMap[shardId].KvStore = map[string]string{}
+			if gid == kv.gid {
+				kv.shardConfigMap[shardId].ShardStatus = Normal
+			} else {
+				kv.shardConfigMap[shardId].ShardStatus = NoResponsible
+			}
+		}
+	} else {
+		pengdingShards := make([]int, 0)
+		for shardId, gid := range conf.Shards {
+			kv.shardConfigMap[shardId].Num = conf.Num
+			if gid == kv.gid {
+				//等待迁移，需要考虑两种情况，前一个迁移的请求还没处理完，后一个请求就已来到，此时要不要继续迁移
+				if kv.shardConfigMap[shardId].ShardStatus != Normal {
+					kv.kvStatus = Migrating
+					kv.shardConfigMap[shardId].ShardStatus = Waiting
+					pengdingShards = append(pengdingShards, shardId)
+				}
+			} else if kv.shardConfigMap[shardId].ShardStatus == Normal {
+				//需要被迁移走的分片
+				kv.shardConfigMap[shardId].ShardStatus = WaitingToBeMigrated
+			}
+		}
+		if len(pengdingShards) > 0 {
+			go kv.startMigration(pengdingShards)
+		}
+
+	}
+	DPrintf("shardKV updateShardConfig, gid: %v, node: %v, lastConfig: %v, currentConfig: %v, shardConfigMap: %v", kv.gid, kv.me, mr.Any2String(kv.lastConfig), mr.Any2String(kv.currentConfig), mr.Any2String(kv.shardConfigMap))
+
+}
 func (kv *ShardKV) maybeSnapshot(index int) {
 	if kv.maxraftstate == -1 {
 		return
@@ -316,11 +348,6 @@ func (kv *ShardKV) maybeSnapshot(index int) {
 		DPrintf("maybeSnapshot starting, index: %v", index)
 		kv.rf.Snapshot(index, kv.encodeSnapshot(index))
 	}
-}
-
-//用于通知指定group，目前用来通知shard迁移成功
-func (kv *ShardKV) Notify() {
-
 }
 
 //上层加锁
@@ -369,69 +396,53 @@ func (kv *ShardKV) checkConfigurationLoop() {
 
 			kv.mu.Lock()
 			defer kv.mu.Unlock()
+			//正在迁移中
+			if kv.kvStatus != Normal {
+				flag := true
+				for _, sid := range kv.pendingMigrationShards {
+					if kv.shardConfigMap[sid].ShardStatus == Waiting {
+						flag = false
+					}
+				}
+				if !flag {
+					return
+				}
+				kv.kvStatus = Normal
+			}
 			if conf.Num <= kv.currentConfig.Num {
 				return
 			}
-
 			op := Op{
 				ClientId:       kv.gid*1000 + kv.me,
-				RequestId:      atomic.AddUint64(&kv.nextRequestId, 1),
+				RequestId:      uint64(conf.Num),
 				OpType:         OpTypeUpdateConfig,
 				Value:          string(Encode2Byte(conf)),
 				StartTimestamp: time.Now().UnixMilli(),
 			}
-			for {
-				if _, _, ok := kv.rf.Start(op); ok {
-					return
-				}
-			}
-			//启动迁移
-			//1 更新到其他group的客户端代理
-			//kv.lastConfig = kv.currentConfig
-			//kv.currentConfig = *conf
-			//for gid, servers := range conf.Groups {
-			//	if gid == 0 {
-			//		continue
-			//	}
-			//	clientEnds := make([]*labrpc.ClientEnd, 0)
-			//	for _, server := range servers {
-			//		end := kv.make_end(server)
-			//		clientEnds = append(clientEnds, end)
-			//	}
-			//	kv.shardKVs[gid] = clientEnds
-			//}
-			////2 迁移分片
-			//kv.startMigration()
+			kv.rf.Start(op)
 		}()
 	}
 }
-func (kv *ShardKV) startMigration() {
-	if kv.lastConfig.Num == 0 {
+
+//从其他group迁移分片数据并同步到本group的所有peer
+func (kv *ShardKV) startMigration(pendingMigrationShards []int) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
 		return
 	}
-	flag := true
-	for flag {
-		flag = false
-		for shardId, gid := range kv.currentConfig.Shards {
-			if gid != kv.gid {
-				continue
+
+	for _, shardId := range pendingMigrationShards {
+		go func(shardId int) {
+			reply := kv.sendPullShard(kv.lastConfig.Shards[shardId], shardId)
+			op := &Op{
+				ClientId:       kv.gid*1000 + kv.me,
+				RequestId:      atomic.AddUint64(&kv.nextRequestId, 1),
+				OpType:         OpTypeMigration,
+				ShardId:        shardId,
+				Value:          string(reply.Data),
+				StartTimestamp: time.Now().UnixMilli(),
 			}
-			//该分片首次被分配，不需要迁移
-			if kv.lastConfig.Shards[shardId] == 0 {
-				flag = true
-				kv.shardConfigMap[shardId].ShardStatus = Normal
-				kv.shardConfigMap[shardId].KvStore = map[string]string{}
-				continue
-			}
-			//缺少应当负责的shard，从其他group拉取
-			if shard, ok := kv.shardConfigMap[shardId]; !ok || shard.ShardStatus != Normal {
-				flag = true
-				reply := kv.sendPullShard(kv.lastConfig.Shards[shardId], shardId)
-				kv.shardConfigMap[shardId].KvStore = Decode2Map(reply.Data)
-				kv.shardConfigMap[shardId].ShardStatus = Normal
-				break
-			}
-		}
+			kv.rf.Start(*op)
+		}(shardId)
 	}
 }
 func (kv *ShardKV) sendPullShard(destGid, shardId int) *PullShardReply {
@@ -445,7 +456,7 @@ func (kv *ShardKV) sendPullShard(destGid, shardId int) *PullShardReply {
 			reply := &PullShardReply{}
 			clientEnd := kv.make_end(servername)
 			ok := clientEnd.Call("ShardKV.PullShard", args, reply)
-			if ok && reply.Err == OK {
+			if ok && (reply.Err == OK || reply.Err == ErrDuplicated) {
 				return reply
 			}
 		}
@@ -461,13 +472,24 @@ func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
 	}()
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	reply.Err = ErrWrongLeader
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		return
+	}
 	reply.Err = ErrWrongGroup
 	if reqId, ok := kv.lastRequestIdMap[args.ClientId]; ok && args.RequestId <= reqId {
+		reply.Err = ErrDuplicated
 		return
 	}
 	kv.lastRequestIdMap[args.ClientId] = args.RequestId
-	if shard, ok := kv.shardConfigMap[args.ShardId]; ok && shard.ShardStatus != NoResponsible {
-		reply.Data = Encode2Byte(kv.shardConfigMap[args.ShardId].KvStore)
+	if _, ok := kv.shardConfigMap[args.ShardId]; ok {
+
+		w := bytes.Buffer{}
+		e := labgob.NewEncoder(&w)
+		e.Encode(kv.shardConfigMap[args.ShardId].Num)
+		e.Encode(args.ShardId)
+		e.Encode(kv.shardConfigMap[args.ShardId].KvStore)
+		reply.Data = Encode2Byte(w.Bytes())
 		kv.shardConfigMap[args.ShardId].ShardStatus = Migrating
 		reply.Err = OK
 	}
@@ -492,16 +514,6 @@ func (kv *ShardKV) pullConfiguration() *shardctrler.Config {
 	}
 }
 
-//
-// the tester calls Kill() when a ShardKV instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
-//
 func (kv *ShardKV) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -513,34 +525,6 @@ func (kv *ShardKV) killed() bool {
 	return z == 1
 }
 
-//
-// servers[] contains the ports of the servers in this group.
-//
-// me is the index of the current server in servers[].
-//
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-//
-// the k/v server should snapshot when Raft's saved state exceeds
-// maxraftstate bytes, in order to allow Raft to garbage-collect its
-// log. if maxraftstate is -1, you don't need to snapshot.
-//
-// gid is this group's GID, for interacting with the shardctrler.
-//
-// pass ctrlers[] to shardctrler.MakeClerk() so you can send
-// RPCs to the shardctrler.
-//
-// make_end(servername) turns a server name from a
-// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
-// send RPCs. You'll need this to send RPCs to other groups.
-//
-// look at client.go for examples of how to use ctrlers[]
-// and make_end() to send RPCs to the group owning a specific shard.
-//
-// StartServer() must return quickly, so it should start goroutines
-// for any long-running work.
-//
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
@@ -560,10 +544,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg, 10)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.shardConfigMap = map[int]*ShardConfig{}
-	kv.shardKVs = map[int][]*labrpc.ClientEnd{}
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
-	kv.decodeSnapshot(persister.ReadSnapshot())
+	//kv.decodeSnapshot(persister.ReadSnapshot())
+	//DPrintf("init kvserver, group: %v, node[%d]", gid, me)
 
 	go kv.applyStateMachineLoop()
 	go kv.checkConfigurationLoop()

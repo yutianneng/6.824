@@ -16,26 +16,29 @@ import (
 type Err string
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrPutAppend   = "ErrPutAppend"
-	ErrTimeout     = "ErrTimeout"
-	ErrDuplicated  = "ErrDuplicated"
+	OK                 = "OK"
+	ErrNoKey           = "ErrNoKey"
+	ErrWrongGroup      = "ErrWrongGroup"
+	ErrWrongLeader     = "ErrWrongLeader"
+	ErrPutAppend       = "ErrPutAppend"
+	ErrTimeout         = "ErrTimeout"
+	ErrDuplicated      = "ErrDuplicated"
+	ErrShardNotArrived = "ErrShardNotArrived"
 )
 
 type status int
 
 const (
-	Normal        status = 1 //正常可读写
-	Migrating     status = 2 //迁移中，暂时不可读写
-	Migrated      status = 3 //已迁移走了
-	Waiting       status = 4 //等待迁移
-	NoResponsible status = 5 //不是自己负责的shard
+	Normal              status = 1 //正常可读写
+	Migrating           status = 2 //迁移中，暂时不可读写
+	Migrated            status = 3 //已迁移走了
+	Waiting             status = 4 //等待迁移
+	NoResponsible       status = 5 //不是自己负责的shard
+	WaitingToBeMigrated status = 6
 )
 
 type ShardConfig struct {
+	Num         int
 	ShardStatus status
 	KvStore     map[string]string
 }
@@ -74,6 +77,7 @@ type GetReply struct {
 type PullShardArgs struct {
 	ClientId  int
 	RequestId uint64
+	Num       int
 	ShardId   int
 }
 

@@ -104,19 +104,19 @@ func (ck *Clerk) Get(key string) string {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
-				DPrintf("ShardKV Clerk Get, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+				DPrintf("ShardKV Clerk Get,gid: %v, args: %v, reply: %v, config: %v", gid, mr.Any2String(args), mr.Any2String(reply), mr.Any2String(ck.config))
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					DPrintf("ShardKV Clerk Get,success args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
-					ck.UpdateConfiguration()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
+		ck.config = ck.sm.Query(-1)
 	}
 
 }

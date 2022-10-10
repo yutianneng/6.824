@@ -117,6 +117,7 @@ func TestJoinLeave(t *testing.T) {
 		check(t, ck, ka[i], va[i])
 	}
 
+	fmt.Printf("TestJoinLeave, join group 101 ...\n")
 	cfg.join(1)
 
 	for i := 0; i < n; i++ {
@@ -125,6 +126,7 @@ func TestJoinLeave(t *testing.T) {
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
+	fmt.Printf("TestJoinLeave, leave ...\n")
 
 	cfg.leave(0)
 
