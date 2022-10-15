@@ -28,6 +28,14 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func DefaultConfig() Config {
+	return Config{
+		Num:    0,
+		Shards: [10]int{},
+		Groups: map[int][]string{},
+	}
+}
+
 type OpType string
 
 const (

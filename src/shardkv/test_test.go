@@ -117,7 +117,6 @@ func TestJoinLeave(t *testing.T) {
 		check(t, ck, ka[i], va[i])
 	}
 
-	fmt.Printf("TestJoinLeave, join group 101 ...\n")
 	cfg.join(1)
 
 	for i := 0; i < n; i++ {
@@ -126,7 +125,6 @@ func TestJoinLeave(t *testing.T) {
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
-	fmt.Printf("TestJoinLeave, leave ...\n")
 
 	cfg.leave(0)
 
@@ -158,6 +156,7 @@ func TestSnapshot(t *testing.T) {
 
 	ck := cfg.makeClient()
 
+	//fmt.Printf("TestSnapshot: join 100\n")
 	cfg.join(0)
 
 	n := 30
@@ -171,9 +170,13 @@ func TestSnapshot(t *testing.T) {
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
+	//fmt.Printf("TestSnapshot: join 101\n")
 
 	cfg.join(1)
+	//fmt.Printf("TestSnapshot: join 102\n")
+
 	cfg.join(2)
+	//fmt.Printf("TestSnapshot: leave 100\n")
 	cfg.leave(0)
 
 	for i := 0; i < n; i++ {
@@ -182,8 +185,11 @@ func TestSnapshot(t *testing.T) {
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
+	//fmt.Printf("TestSnapshot: leave 101\n")
 
 	cfg.leave(1)
+	//fmt.Printf("TestSnapshot: join 100\n")
+
 	cfg.join(0)
 
 	for i := 0; i < n; i++ {
@@ -201,17 +207,20 @@ func TestSnapshot(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
+	//fmt.Printf("TestSnapshot, checklogs\n")
 	cfg.checklogs()
-
+	//fmt.Printf("TestSnapshot, shutdown group...\n")
 	cfg.ShutdownGroup(0)
 	cfg.ShutdownGroup(1)
 	cfg.ShutdownGroup(2)
+	//fmt.Printf("TestSnapshot, start group...\n")
 
 	cfg.StartGroup(0)
 	cfg.StartGroup(1)
 	cfg.StartGroup(2)
 
 	for i := 0; i < n; i++ {
+		//fmt.Printf("check ka[%d]: %v va[%d]: %v\n", i, ka[i], i, va[i])
 		check(t, ck, ka[i], va[i])
 	}
 
@@ -226,6 +235,7 @@ func TestMissChange(t *testing.T) {
 
 	ck := cfg.makeClient()
 
+	//fmt.Printf("TestMissChange: join 100...\n")
 	cfg.join(0)
 
 	n := 10
@@ -239,15 +249,19 @@ func TestMissChange(t *testing.T) {
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
+	//fmt.Printf("TestMissChange: join 101...\n")
 
 	cfg.join(1)
 
 	cfg.ShutdownServer(0, 0)
 	cfg.ShutdownServer(1, 0)
 	cfg.ShutdownServer(2, 0)
+	//fmt.Printf("TestMissChange: join 102...\n")
 
 	cfg.join(2)
+	//fmt.Printf("TestMissChange: leave 101...\n")
 	cfg.leave(1)
+	//fmt.Printf("TestMissChange: leave 100...\n")
 	cfg.leave(0)
 
 	for i := 0; i < n; i++ {
@@ -256,6 +270,7 @@ func TestMissChange(t *testing.T) {
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
+	//fmt.Printf("TestMissChange: join 101...\n")
 
 	cfg.join(1)
 
@@ -269,12 +284,13 @@ func TestMissChange(t *testing.T) {
 	cfg.StartServer(0, 0)
 	cfg.StartServer(1, 0)
 	cfg.StartServer(2, 0)
-
+	//fmt.Printf("TestMissChange: restart...\n")
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 		x := randstring(20)
 		ck.Append(ka[i], x)
 		va[i] += x
+		//fmt.Printf("TestMissChange: append key: %v, val: %v\n", ka[i], va[i])
 	}
 
 	time.Sleep(2 * time.Second)
@@ -282,8 +298,11 @@ func TestMissChange(t *testing.T) {
 	cfg.ShutdownServer(0, 1)
 	cfg.ShutdownServer(1, 1)
 	cfg.ShutdownServer(2, 1)
+	//fmt.Printf("TestMissChange: restart...\n")
 
+	//fmt.Printf("TestMissChange: join 100...\n")
 	cfg.join(0)
+	//fmt.Printf("TestMissChange: leave 102...\n")
 	cfg.leave(2)
 
 	for i := 0; i < n; i++ {
@@ -291,6 +310,7 @@ func TestMissChange(t *testing.T) {
 		x := randstring(20)
 		ck.Append(ka[i], x)
 		va[i] += x
+		//fmt.Printf("TestMissChange: append key: %v, val: %v\n", ka[i], va[i])
 	}
 
 	cfg.StartServer(0, 1)
@@ -336,7 +356,7 @@ func TestConcurrent1(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-
+	//fmt.Printf("TestConcurrent1 starting concurrent\n")
 	for i := 0; i < n; i++ {
 		go ff(i)
 	}
@@ -597,7 +617,7 @@ func TestUnreliable2(t *testing.T) {
 			va[i] += x
 		}
 	}
-
+	//fmt.Printf("TestUnreliable2, starting concurrent...")
 	for i := 0; i < n; i++ {
 		go ff(i)
 	}

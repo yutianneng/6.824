@@ -212,7 +212,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		reply.Err = ErrTimeout
 		reply.WrongLeader = false
 	}
-	DPrintf("controller server join, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+	//DPrintf("controller server join, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 
 }
 
@@ -242,7 +242,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	sc.opContextMap[opContext.UniqueRequestId] = opContext
 	sc.mu.Unlock()
 	defer func() {
-		DPrintf("controller server Leave, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		//DPrintf("controller server Leave, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 		sc.mu.Lock()
 		delete(sc.opContextMap, opContext.UniqueRequestId)
 		sc.mu.Unlock()
@@ -285,7 +285,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	sc.opContextMap[opContext.UniqueRequestId] = opContext
 	sc.mu.Unlock()
 	defer func() {
-		DPrintf("controller server Move, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		//DPrintf("controller server Move, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 		sc.mu.Lock()
 		delete(sc.opContextMap, opContext.UniqueRequestId)
 		sc.mu.Unlock()
@@ -326,7 +326,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	sc.mu.Unlock()
 
 	defer func() {
-		DPrintf("controller server Query, args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
+		DPrintf("controller server Query, args: %v, reply: %v, configs: %v", mr.Any2String(args), mr.Any2String(reply), mr.Any2String(sc.configs))
 		sc.mu.Lock()
 		delete(sc.opContextMap, opContext.UniqueRequestId)
 		sc.mu.Unlock()
@@ -371,28 +371,28 @@ func (sc *ShardCtrler) applyStateMachineLoop() {
 					case OpTypeJoin:
 						number := sc.nextNumber
 						sc.nextNumber++
-						old := sc.Config(-1)
+						//old := sc.Config(-1)
 						conf := sc.rebalanceJoin(number, op.Value.NewGroups)
 						sc.configs = append(sc.configs, *conf)
 						sc.lastRequestIdMap[op.ClientId] = op.RequestId
-						DPrintf("controller applyLoop join, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
+						//DPrintf("controller applyLoop join, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
 					case OpTypeLeave:
 						number := sc.nextNumber
 						sc.nextNumber++
-						old := sc.Config(-1)
+						//old := sc.Config(-1)
 						conf := sc.rebalanceLeave(number, op.Value.LeaveGids)
 						sc.configs = append(sc.configs, *conf)
 						sc.lastRequestIdMap[op.ClientId] = op.RequestId
-						DPrintf("controller applyLoop leave, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
+						//DPrintf("controller applyLoop leave, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
 
 					case OpTypeMove:
 						number := sc.nextNumber
 						sc.nextNumber++
-						old := sc.Config(-1)
+						//old := sc.Config(-1)
 						conf := sc.rebalanceMove(number, op.Value.ShardId, op.Value.DestGid)
 						sc.configs = append(sc.configs, *conf)
 						sc.lastRequestIdMap[op.ClientId] = op.RequestId
-						DPrintf("controller applyLoop move, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
+						//DPrintf("controller applyLoop move, old config: %v new config: %v", mr.Any2String(old), mr.Any2String(conf))
 					case OpTypeQuery:
 						//Get请求不需要更新lastRequestId
 						val = sc.Config(op.Number)

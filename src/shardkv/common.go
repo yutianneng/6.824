@@ -1,7 +1,6 @@
 package shardkv
 
 import (
-	"6.824/shardctrler"
 	"encoding/json"
 )
 
@@ -16,36 +15,86 @@ import (
 type Err string
 
 const (
-	OK                 = "OK"
-	ErrNoKey           = "ErrNoKey"
-	ErrWrongGroup      = "ErrWrongGroup"
-	ErrWrongLeader     = "ErrWrongLeader"
-	ErrPutAppend       = "ErrPutAppend"
-	ErrTimeout         = "ErrTimeout"
-	ErrDuplicated      = "ErrDuplicated"
-	ErrShardNotArrived = "ErrShardNotArrived"
+	OK             = "OK"
+	ErrNoKey       = "ErrNoKey"
+	ErrWrongGroup  = "ErrWrongGroup"
+	ErrWrongLeader = "ErrWrongLeader"
+	ErrPutAppend   = "ErrPutAppend"
+	ErrTimeout     = "ErrTimeout"
+	ErrDuplicated  = "ErrDuplicated"
+	ErrNotReady    = "ErrNotReady"
+	ErrOutDated    = "ErrOutDated"
 )
 
-type status int
+type Status int
+
+//每个group拥有的分片可能是以下情况
 
 const (
-	Normal              status = 1 //正常可读写
-	Migrating           status = 2 //迁移中，暂时不可读写
-	Migrated            status = 3 //已迁移走了
-	Waiting             status = 4 //等待迁移
-	NoResponsible       status = 5 //不是自己负责的shard
-	WaitingToBeMigrated status = 6
+	Serving   Status = 1 //拥有属于自己的分片，可正常读写
+	Pulling   Status = 2 //正在迁移隶属自己的分片
+	BePulling Status = 3 //拥有但不属于自己的分片，等待对方迁移
+	GCing     Status = 4
+	NoServing Status = 5
 )
 
-type ShardConfig struct {
-	Num         int
-	ShardStatus status
-	KvStore     map[string]string
+type OpType string
+
+const (
+	OpTypeGet          = "Get"
+	OpTypePut          = "Put"
+	OpTypeAppend       = "Append"
+	OpTypeUpdateConfig = "UpdateConfig"
+	OpTypeAddShard     = "AddShard"
+	OpTypeDeleteShard  = "DeleteShard"
+)
+
+type Op struct {
+	ClientId       int
+	RequestId      uint64
+	OpType         OpType
+	Key            string
+	Value          interface{}
+	StartTimestamp int64
 }
 
-func (s *ShardConfig) String() string {
+type OpContext struct {
+	ClientId        int
+	RequestId       uint64
+	UniqueRequestId uint64
+	Op              *Op
+	Term            int
+	WaitCh          chan *ExecuteResponse
+}
+type ExecuteResponse struct {
+	Err   Err
+	Value interface{}
+}
+type Shard struct {
+	ShardStatus      Status
+	KvStore          map[string]string
+	LastRequestIdMap map[int]uint64 //去重
+}
+
+func (s *Shard) String() string {
 	bytes, _ := json.Marshal(s)
 	return string(bytes)
+}
+func (s *Shard) deepCopy() *Shard {
+	shard := &Shard{
+		ShardStatus: s.ShardStatus,
+	}
+	lastRequestIdMap := map[int]uint64{}
+	for k, v := range s.LastRequestIdMap {
+		lastRequestIdMap[k] = v
+	}
+	shard.LastRequestIdMap = lastRequestIdMap
+	kvStore := map[string]string{}
+	for k, v := range s.KvStore {
+		kvStore[k] = v
+	}
+	shard.KvStore = kvStore
+	return shard
 }
 
 // Put or Append
@@ -54,7 +103,6 @@ type PutAppendArgs struct {
 	RequestId uint64
 	Key       string
 	Value     string
-	ShardId   int
 	Op        string // "Put" or "Append"
 }
 
@@ -66,7 +114,6 @@ type GetArgs struct {
 	ClientId  int
 	RequestId uint64
 	Key       string
-	ShardId   int
 }
 
 type GetReply struct {
@@ -75,32 +122,24 @@ type GetReply struct {
 }
 
 type PullShardArgs struct {
-	ClientId  int
-	RequestId uint64
-	Num       int
-	ShardId   int
+	Num      int
+	ShardIds []int
 }
 
 type PullShardReply struct {
-	Err  Err
-	Data []byte
+	Err      Err
+	Num      int
+	ShardMap map[int]*Shard
+}
+
+type DeleteShardArgs struct {
+	Num      int
+	ShardIds []int
+}
+type DeleteShardReply struct {
+	Err Err
 }
 
 func UniqueRequestId(clientId int, requestId uint64) uint64 {
 	return uint64(clientId<<32) + requestId&0xffffffff
-}
-
-func Decode2Map(data []byte) map[string]string {
-	m := map[string]string{}
-	json.Unmarshal(data, &m)
-	return m
-}
-func Decode2Config(data []byte) *shardctrler.Config {
-	conf := &shardctrler.Config{}
-	json.Unmarshal(data, conf)
-	return conf
-}
-func Encode2Byte(m interface{}) []byte {
-	bytes, _ := json.Marshal(m)
-	return bytes
 }

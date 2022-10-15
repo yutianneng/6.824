@@ -54,15 +54,6 @@ type Clerk struct {
 	nextRequestId   uint64 //clientId<<12+nextRequestId
 }
 
-//
-// the tester calls MakeClerk.
-//
-// ctrlers[] is needed to call shardctrler.MakeClerk().
-//
-// make_end(servername) turns a server name from a
-// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
-// send RPCs.
-//
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
@@ -86,14 +77,13 @@ func (ck *Clerk) Get(key string) string {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 	for ck.config.Num == 0 {
-		ck.UpdateConfiguration()
+		ck.config = ck.sm.Query(-1)
 	}
 	shard := key2shard(key)
 	args := GetArgs{
 		ClientId:  ck.clientId,
 		RequestId: atomic.AddUint64(&ck.nextRequestId, 1),
 		Key:       key,
-		ShardId:   shard,
 	}
 	for {
 		gid := ck.config.Shards[shard]
@@ -104,19 +94,19 @@ func (ck *Clerk) Get(key string) string {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
-				DPrintf("ShardKV Clerk Get,gid: %v, args: %v, reply: %v, config: %v", gid, mr.Any2String(args), mr.Any2String(reply), mr.Any2String(ck.config))
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+				DPrintf("ShardKV Clerk Get,gid: %v, shardId: %v, args: %v, reply: %v, config: %v", gid, shard, mr.Any2String(args), mr.Any2String(reply), mr.Any2String(ck.config))
+				if ok && (reply.Err == OK) {
 					DPrintf("ShardKV Clerk Get,success args: %v, reply: %v", mr.Any2String(args), mr.Any2String(reply))
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 		ck.config = ck.sm.Query(-1)
+		DPrintf("Clerk update config: %v", mr.Any2String(ck.config))
 	}
 
 }
@@ -129,7 +119,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 	for ck.config.Num == 0 {
-		ck.UpdateConfiguration()
+		ck.config = ck.sm.Query(-1)
 	}
 	shard := key2shard(key)
 
@@ -139,29 +129,25 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:       key,
 		Value:     value,
 		Op:        op,
-		ShardId:   shard,
 	}
 	for {
 		gid := ck.config.Shards[shard]
-		//DPrintf("ShardKV Client.PutAppend, gid: %v, shardId: %d", gid, shard)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
-				//DPrintf("ShardKV Client.PutAppend, gid: %v, shardId: %d, args: %v", gid, shard, mr.Any2String(args))
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					DPrintf("shardKV Clerk.PutAppend args: %v reply: %v", mr.Any2String(args), mr.Any2String(reply))
+				DPrintf("shardKV Clerk.PutAppend args: %v reply: %v", mr.Any2String(args), mr.Any2String(reply))
+				if ok && (reply.Err == OK || reply.Err == ErrDuplicated) {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
-					ck.UpdateConfiguration()
 					break
 				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
+		ck.config = ck.sm.Query(-1)
 	}
 }
 
@@ -170,15 +156,4 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
-}
-
-//更新路由信息,上层必须加锁
-func (ck *Clerk) UpdateConfiguration() {
-
-	conf := ck.sm.Query(-1)
-	if ck.config.Num != 0 && conf.Num <= ck.config.Num {
-		return
-	}
-	ck.config = conf
-	DPrintf("shardkv client update config: %v", mr.Any2String(conf))
 }
